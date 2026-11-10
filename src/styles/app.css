@@ -571,6 +571,11 @@ body.ql-fullscreen .ql-titlebar, body.ql-fullscreen .ql-tabs, body.ql-fullscreen
 .qs-sel.qs-sel-locked { outline-color: #9aa0a6; cursor: default; }
 .qs-handle { position: absolute; width: calc(10px * var(--qs-inv, 1)); height: calc(10px * var(--qs-inv, 1)); background: #fff; border: calc(1.5px * var(--qs-inv, 1)) solid #4285f4; border-radius: 50%; margin: calc(-5px * var(--qs-inv, 1)) 0 0 calc(-5px * var(--qs-inv, 1)); pointer-events: auto; touch-action: none; }
 .ql-touch .qs-handle, .qs-canvas:has(.qs-handle) .qs-handle:where(:hover) { width: calc(16px * var(--qs-inv, 1)); height: calc(16px * var(--qs-inv, 1)); margin: calc(-8px * var(--qs-inv, 1)) 0 0 calc(-8px * var(--qs-inv, 1)); }
+/* Fingers: larger handles, and a touch target that reaches beyond the drawn circle. */
+@media (pointer: coarse) {
+  .qs-handle { width: calc(16px * var(--qs-inv, 1)); height: calc(16px * var(--qs-inv, 1)); margin: calc(-8px * var(--qs-inv, 1)) 0 0 calc(-8px * var(--qs-inv, 1)); }
+  .qs-handle::before { content: ""; position: absolute; inset: calc(-12px * var(--qs-inv, 1)); border-radius: 50%; }
+}
 .qs-h-nw { left: 0; top: 0; cursor: nwse-resize; } .qs-h-n { left: 50%; top: 0; cursor: ns-resize; } .qs-h-ne { left: 100%; top: 0; cursor: nesw-resize; }
 .qs-h-e { left: 100%; top: 50%; cursor: ew-resize; } .qs-h-se { left: 100%; top: 100%; cursor: nwse-resize; } .qs-h-s { left: 50%; top: 100%; cursor: ns-resize; }
 .qs-h-sw { left: 0; top: 100%; cursor: nesw-resize; } .qs-h-w { left: 0; top: 50%; cursor: ew-resize; }

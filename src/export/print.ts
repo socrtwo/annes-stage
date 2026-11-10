@@ -112,16 +112,16 @@ export async function printDeck(app: App, o: PrintOptions): Promise<void> {
   document.querySelector('.qs-print-root')?.remove();
   document.head.appendChild(style);
   document.body.appendChild(root);
-  const cleanup = () => { style.remove(); root.remove(); window.removeEventListener('afterprint', cleanup); };
-  window.addEventListener('afterprint', cleanup);
+  const cleanup = () => { style.remove(); root.remove(); };
   try {
     // Let fonts and pictures settle before the print snapshot.
     await (document as any).fonts?.ready;
     await new Promise((r) => setTimeout(r, 50));
+    // Resolves when the print UI has closed. Until then the pages must stay: the print UI lays the
+    // page out again whenever its preview refreshes, and without them it would show the app itself.
     await printDocument(app.tab.displayName || 'Presentation');
   } finally {
-    // Browsers that print synchronously have printed by now; others clean up on afterprint.
-    setTimeout(cleanup, 60000);
+    setTimeout(cleanup, 500);
   }
 }
 
