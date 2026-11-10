@@ -94,6 +94,9 @@ async function editCells(app: App): Promise<void> {
   const work = clone(t0);
   let cur = currentCell(app, work);
   const host = h('div', { style: 'overflow:auto;max-height:55vh' });
+  // Touch has no Shift key: with this on, tapping a cell extends the range instead of moving to it.
+  const extendBox = h('input', { type: 'checkbox' }) as HTMLInputElement;
+  const extendRow = h('label', { class: 'ql-check', style: 'display:flex;align-items:center;gap:6px;margin:0 0 6px' }, extendBox, 'Extend selection (tap cells to select a range for Merge)');
   const draw = () => {
     host.textContent = '';
     const tbl = h('table', { style: 'border-collapse:collapse' });
@@ -106,7 +109,8 @@ async function editCells(app: App): Promise<void> {
         ta.value = cellText(cell);
         ta.addEventListener('input', () => setText(cell, ta.value));
         ta.addEventListener('focus', () => { cur = { r, c, r2: r, c2: c }; for (const x of host.querySelectorAll('textarea')) (x as HTMLElement).style.outline = ''; ta.style.outline = '2px solid #4285f4'; });
-        ta.addEventListener('mousedown', (e) => { if (e.shiftKey) { e.preventDefault(); cur = { ...cur, r2: r, c2: c }; draw(); } });
+        // mousedown also arrives for a finger tap; cancelling it keeps focus (and the phone keyboard) where it is.
+        ta.addEventListener('mousedown', (e) => { if (e.shiftKey || extendBox.checked) { e.preventDefault(); cur = { ...cur, r2: r, c2: c }; draw(); } });
         ta.addEventListener('keydown', (e) => e.stopPropagation());
         tr.appendChild(h('td', { rowspan: String(cell.rowSpan || 1), colspan: String(cell.colSpan || 1), style: 'padding:2px;vertical-align:top' }, ta));
       });
@@ -117,8 +121,8 @@ async function editCells(app: App): Promise<void> {
   draw();
   const act = (fn: () => void) => () => { fn(); draw(); };
   const r = await openDialog({
-    title: 'Edit Table', wide: true, content: host, ok: 'Apply',
-    help: 'Click a cell to make it current; Shift+click another cell to select a range for Merge.',
+    title: 'Edit Table', wide: true, content: h('div', null, extendRow, host), ok: 'Apply',
+    help: 'Click a cell to make it current; Shift+click another cell (or turn on Extend selection and tap it) to select a range for Merge.',
     buttons: [
       { label: 'Row Above', onClick: act(() => { insertRow(work, cur.r); cur.r++; cur.r2 = cur.r; }) },
       { label: 'Row Below', onClick: act(() => insertRow(work, cur.r + 1)) },
@@ -126,7 +130,7 @@ async function editCells(app: App): Promise<void> {
       { label: 'Column Right', onClick: act(() => insertCol(work, cur.c + 1)) },
       { label: 'Delete Row', onClick: act(() => { deleteRow(work, cur.r); cur = { r: Math.min(cur.r, work.rows.length - 1), c: cur.c, r2: Math.min(cur.r, work.rows.length - 1), c2: cur.c }; }) },
       { label: 'Delete Column', onClick: act(() => { deleteCol(work, cur.c); cur = { r: cur.r, c: Math.min(cur.c, work.cols.length - 1), r2: cur.r, c2: Math.min(cur.c, work.cols.length - 1) }; }) },
-      { label: 'Merge', onClick: act(() => mergeCells(work, cur.r, cur.c, cur.r2, cur.c2)) },
+      { label: 'Merge', onClick: act(() => { mergeCells(work, cur.r, cur.c, cur.r2, cur.c2); extendBox.checked = false; }) },
       { label: 'Split', onClick: act(() => splitCell(work, cur.r, cur.c)) },
     ],
   });
