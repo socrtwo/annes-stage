@@ -11,7 +11,7 @@ import { aiSettings, saveAiSettings, resolveProvider } from '../ai/store';
 import { providerById } from '../ai/providers';
 import { chat, activeEnsemble, type ChatMessage, type ContentPart } from '../ai/client';
 import { outcomeLine, type EnsembleMode } from '../ai/ensemble';
-import { SLIDES_SYSTEM, TEXT_TASKS, addSlidePrompt, docToDeckPrompt, draftDeckPrompt, linesOf, outlineToSlidesPrompt, parseJsonLoose, parseOutline, cleanText, type OutlineSlide } from '../ai/slides';
+import { SLIDES_SYSTEM, TEXT_TASKS, addSlidePrompt, docToDeckPrompt, draftDeckPrompt, linesOf, outlineToSlidesPrompt, parseJsonLoose, parseOutline, parseQuiz, quizOutline, cleanText, type OutlineSlide } from '../ai/slides';
 import { edit, shapeText, textTargets } from '../edit/ops';
 import { openDialog, toast, confirmDialog, promptDialog } from '../ui/dialog';
 import { h, pickFile } from '../ui/dom';
@@ -47,14 +47,32 @@ export async function ensureAiReady(app: App, reason = 'This command needs an AI
 
 let controller: AbortController | null = null;
 
+/** "Ask before sending a whole deck or long document": the size from which a whole-deck or document command asks first. */
+export const LARGE_SEND_CHARS = 5000;
+
+const promptChars = (p: string | ContentPart[]) => (typeof p === 'string' ? p.length : p.reduce((n, x) => n + (x.type === 'text' ? x.text.length : 0), 0));
+
+/** AI Settings ▸ "Ask before sending a whole deck or long document": true when the command may go ahead. */
+async function confirmLargeSend(prompt: string | ContentPart[], what: 'deck' | 'document'): Promise<boolean> {
+  if (!aiSettings().confirmDocument) return true;
+  const chars = promptChars(prompt);
+  if (chars < LARGE_SEND_CHARS) return true;
+  const cloud = aiRecipients().filter(cloudId);
+  if (!cloud.length) return true;
+  return confirmDialog('Send to a Cloud Service?',
+    `This command sends ${what === 'deck' ? 'the text of the whole presentation' : 'the document'} (about ${chars.toLocaleString()} characters) to ${names(cloud)}.\nYou can turn this question off in AI ▸ AI Settings.`,
+    'Send', 'Cancel');
+}
+
 function system(): string {
   const s = aiSettings();
   return [SLIDES_SYSTEM, s.language && s.language !== 'auto' ? `Write in ${s.language}.` : '', s.styleGuide ? `Style guide: ${s.styleGuide}` : ''].filter(Boolean).join('\n');
 }
 
 /** Sends a prompt and returns the answer text (with a status toast while waiting). */
-export async function ask(app: App, prompt: string | ContentPart[], opts: { tier?: 'fast' | 'quality'; maxTokens?: number } = {}): Promise<string | null> {
+export async function ask(app: App, prompt: string | ContentPart[], opts: { tier?: 'fast' | 'quality'; maxTokens?: number; /** A whole-deck or document command: may ask first (confirmDocument). */ whole?: 'deck' | 'document' } = {}): Promise<string | null> {
   if (!(await ensureAiReady(app))) return null;
+  if (opts.whole && !(await confirmLargeSend(prompt, opts.whole))) return null;
   controller?.abort();
   controller = new AbortController();
   const ctl = controller;
@@ -115,6 +133,11 @@ export function slidesFromOutline(app: App, outline: OutlineSlide[], opts: { tit
     if (o.notes) s.notes = textToNotes(o.notes);
     return s;
   });
+}
+
+/** A slide with nothing on it, or only placeholders with no text (the blank slide of a new deck). */
+function isBlankSlide(s: Slide): boolean {
+  return s.elements.every((e) => !!(e as ShapeElement).ph && e.kind === 'shape' && !shapeText(e).trim()) && !notesToText(s.notes).trim();
 }
 
 async function addOutlineSlides(app: App, outline: OutlineSlide[], label: string, titleSlide = false, newDeck = false): Promise<void> {
@@ -294,8 +317,12 @@ def([
       if (r.where === 'here' && app.deck.slides.length === 1 && !slideTitle(app.deck.slides[0])) {
         const outline = parseOutline(ans);
         const d = app.deck;
+        // Only the one blank slide the deck started with is removed, and only if it is still blank.
+        const originalId = d.slides[0].id;
+        const before = d.slides.length;
         await addOutlineSlides(app, outline, 'Draft Presentation', true);
-        if (d.slides.length > outline.length) d.transact('Remove Empty Slide', () => { d.data.slides = d.data.slides.filter((s) => slideTitle(s) || s.elements.some((e) => shapeText(e).trim())); });
+        const orig = d.slides.find((s) => s.id === originalId);
+        if (orig && d.slides.length > before && isBlankSlide(orig)) d.transact('Remove Empty Slide', () => { d.data.slides = d.data.slides.filter((s) => s.id !== originalId); });
         return;
       }
       await addOutlineSlides(app, parseOutline(ans), 'Draft Presentation', true, r.where === 'new');
@@ -322,7 +349,7 @@ def([
       if (!text) { toast('That file has no text.'); return; }
       if (text.length > 60000) { text = text.slice(0, 60000); toast('The document is long; only its first 60,000 characters are used.'); }
       const n = Math.max(4, Math.min(30, Math.round(text.split(/\s+/).length / 180)));
-      const ans = await ask(app, docToDeckPrompt(text, n), { maxTokens: 6000 });
+      const ans = await ask(app, docToDeckPrompt(text, n), { maxTokens: 6000, whole: 'document' });
       if (ans != null) await addOutlineSlides(app, parseOutline(ans), 'Document to Deck', true, true);
     },
   },
@@ -359,7 +386,7 @@ def([
     id: 'ai.summarize', label: 'Summarize Deck', icon: 'summarize', tab: 'AI', group: 'Notes', edits: true, isEnabled: (app) => app.deck.slides.length > 1,
     tip: 'Add a summary slide at the end',
     run: async (app) => {
-      const ans = await ask(app, TEXT_TASKS.summarize.prompt(deckText(app)));
+      const ans = await ask(app, TEXT_TASKS.summarize.prompt(deckText(app)), { whole: 'deck' });
       if (ans == null) return;
       const out = await previewText('Summary Slide', linesOf(ans).join('\n'), 'Add Summary Slide');
       if (out == null) return;
@@ -372,7 +399,7 @@ def([
     id: 'ai.anticipateQuestions', label: 'Anticipate Questions', icon: 'contact_support', tab: 'AI', group: 'Notes', edits: false, isEnabled: (app) => app.deck.slides.length > 0,
     tip: 'Questions the audience is likely to ask, with suggested answers (added to the last slide\'s notes if you choose)',
     run: async (app) => {
-      const ans = await ask(app, TEXT_TASKS.anticipateQuestions.prompt(deckText(app)));
+      const ans = await ask(app, TEXT_TASKS.anticipateQuestions.prompt(deckText(app)), { whole: 'deck' });
       if (ans == null) return;
       const r = await openDialog({ title: 'Anticipated Questions', wide: true, ok: 'Add to Last Slide\'s Notes', cancel: 'Close', fields: [{ key: 't', type: 'textarea', rows: 16, value: cleanText(ans), label: 'Questions and answers' }] });
       if (!r) return;
@@ -421,14 +448,17 @@ def([
     id: 'ai.quizFromDeck', label: 'Generate Quiz from Deck', icon: 'quiz', tab: 'AI', group: 'More', edits: true, isEnabled: (app) => app.deck.slides.length > 0,
     tip: 'Add question slides (answers in the speaker notes) at the end',
     run: async (app) => {
-      const ans = await ask(app, TEXT_TASKS.quizFromDeck.prompt(deckText(app)), { maxTokens: 2500 });
+      const ans = await ask(app, TEXT_TASKS.quizFromDeck.prompt(deckText(app)), { maxTokens: 2500, whole: 'deck' });
       if (ans == null) return;
-      const qs = parseJsonLoose<{ question: string; choices: string[]; answer: number }[]>(ans);
-      if (!Array.isArray(qs) || !qs.length) { toast('The AI answer was not a list of questions.'); return; }
-      const outline: OutlineSlide[] = qs.filter((q) => q?.question).map((q, i) => ({ title: `Question ${i + 1}: ${q.question}`, bullets: (q.choices || []).map((c, k) => `${'ABCDEFG'[k]}. ${c}`), notes: `Answer: ${'ABCDEFG'[q.answer] || '?'}. ${q.choices?.[q.answer] || ''}` }));
-      const slides = slidesFromOutline(app, outline);
-      app.deck.transact('Generate Quiz', () => app.deck.data.slides.push(...slides));
-      app.goToSlide(slides[0].id);
+      try {
+        const qs = parseQuiz(ans);
+        if (!qs.length) { toast('The AI answer was not a list of questions.'); return; }
+        const slides = slidesFromOutline(app, quizOutline(qs));
+        app.deck.transact('Generate Quiz', () => app.deck.data.slides.push(...slides));
+        app.goToSlide(slides[0].id);
+      } catch (e: any) {
+        toast(`Generate Quiz: the questions could not be added (${e?.message || e}).`, { ms: 7000 });
+      }
     },
   },
   {
@@ -443,7 +473,7 @@ def([
         if (!r || !String(r.q).trim()) return;
         const q = String(r.q).trim();
         const prompt = history.length ? q : `Presentation text:\n"""\n${ctx}\n"""\n\nQuestion: ${q}`;
-        const ans = await ask(app, history.length ? [{ type: 'text', text: `${history.map((m) => `${m.role === 'user' ? 'Q' : 'A'}: ${typeof m.content === 'string' ? m.content : ''}`).join('\n')}\nQ: ${prompt}` }] : prompt);
+        const ans = await ask(app, history.length ? [{ type: 'text', text: `${history.map((m) => `${m.role === 'user' ? 'Q' : 'A'}: ${typeof m.content === 'string' ? m.content : ''}`).join('\n')}\nQ: ${prompt}` }] : prompt, history.length ? {} : { whole: 'deck' });
         if (ans == null) return;
         history.push({ role: 'user', content: prompt }, { role: 'assistant', content: ans });
         log.append(h('p', null, h('b', null, 'You: '), q), h('p', null, h('b', null, 'AI: '), cleanText(ans)));
@@ -465,7 +495,7 @@ def([
       if (!p) return;
       const inp = textInput(app);
       if (!inp && p.input === 'selection') { toast('Select some text or a text box first.'); return; }
-      const ans = await ask(app, `${p.prompt}\n"""\n${p.input === 'document' ? deckText(app) : inp?.text || ''}\n"""`);
+      const ans = await ask(app, `${p.prompt}\n"""\n${p.input === 'document' ? deckText(app) : inp?.text || ''}\n"""`, p.input === 'document' ? { whole: 'deck' } : {});
       if (ans == null) return;
       const out = await previewText(p.name, cleanText(ans), inp ? 'Replace Selection' : 'Close');
       if (out != null && inp) inp.apply(out.split('\n'), p.name);

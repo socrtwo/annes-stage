@@ -32,8 +32,12 @@ interface QuillNativePlugin {
   keepAwake(opts: { on: boolean }): Promise<void>;
   addListener(event: 'fileOpened', cb: (f: { uri?: string; name?: string; mime?: string; data?: string }) => void): Promise<{ remove: () => void }>;
   addListener(event: 'oauthCallback', cb: (r: { url: string }) => void): Promise<{ remove: () => void }>;
-  /** Android Keystore-backed encrypted preferences (API keys). */
-  secureSet(opts: { key: string; value: string }): Promise<void>;
+  /**
+   * Android Keystore-backed encrypted preferences (API keys). The desktop app answers
+   * {stored:false, reason:'no-encryption'} when the system has no keychain (Linux without a secret
+   * service) unless `allowPlain` is set; then it stores the key unencrypted and says `plaintext`.
+   */
+  secureSet(opts: { key: string; value: string; allowPlain?: boolean }): Promise<void | SecureSetResult>;
   secureGet(opts: { key: string }): Promise<{ value?: string | null }>;
   secureRemove(opts: { key: string }): Promise<void>;
   /** ClipboardManager text (foreground app only; Android 12+ shows a "pasted" notice). */
@@ -51,8 +55,10 @@ interface DesktopBridge extends QuillNativePlugin {
   /** 'win32' | 'darwin' | 'linux' */
   platform: string;
   openExternal(opts: { url: string }): Promise<void>;
-  /** HTTP from the main process (no CORS), for AI providers that block browsers. */
-  http(opts: { url: string; method: string; headers: Record<string, string>; data?: unknown }): Promise<{ status: number; text: string }>;
+  /** HTTP from the main process (no CORS), for AI providers that block browsers. `id` lets httpAbort cancel it; `timeoutMs` gives up after that long. */
+  http(opts: { url: string; method: string; headers: Record<string, string>; data?: unknown; id?: string; timeoutMs?: number }): Promise<{ status: number; text: string }>;
+  /** Cancel the http request started with this id (Stop AI). Older desktop builds lack it. */
+  httpAbort?(opts: { id: string }): Promise<void>;
   /** Write the document to a temporary file and open it with the program registered for its type. */
   openWith?(opts: { name: string; data: string }): Promise<{ ok: boolean; error?: string }>;
 }
@@ -68,8 +74,15 @@ export const isDesktop = (): boolean => !!desktop;
 export const isIOS = (): boolean => Capacitor.getPlatform() === 'ios';
 /** 'android' | 'ios' | 'web' | 'windows' | 'macos' | 'linux' */
 export const platformName = (): string => (desktop ? ({ win32: 'windows', darwin: 'macos' } as Record<string, string>)[desktop.platform] || 'linux' : Capacitor.getPlatform());
-/** Desktop HTTP without CORS, or null when not on desktop. */
-export const desktopHttp = desktop ? (o: { url: string; method: string; headers: Record<string, string>; data?: unknown }) => desktop.http(o) : null;
+/** Desktop HTTP without CORS, or null when not on desktop. Aborting `signal` cancels the request in the main process. */
+export const desktopHttp = desktop
+  ? (o: { url: string; method: string; headers: Record<string, string>; data?: unknown; timeoutMs?: number }, signal?: AbortSignal): Promise<{ status: number; text: string }> => {
+    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    const stop = () => { void desktop.httpAbort?.({ id })?.catch(() => undefined); };
+    signal?.addEventListener('abort', stop, { once: true });
+    return desktop.http({ ...o, id }).finally(() => signal?.removeEventListener('abort', stop));
+  }
+  : null;
 
 // iOS: files live in the app's Documents folder, which the Files app shows.
 const IOS_PREFIX = 'ios-doc:';
@@ -336,8 +349,12 @@ export async function openInQuillApp(app: QuillApp, data: ArrayBuffer, name: str
 // ------------------------------------------------------------------------------------------
 // Secure storage, clipboard, OAuth loopback, app resume (AI setup)
 
-export async function secureSet(key: string, value: string): Promise<void> {
-  await Native.secureSet({ key, value });
+export interface SecureSetResult { stored?: boolean; plaintext?: boolean; reason?: string }
+
+/** Stores a secret. Resolves {stored:false} when the system cannot encrypt it and `allowPlain` was not given (nothing was written). */
+export async function secureSet(key: string, value: string, opts: { allowPlain?: boolean } = {}): Promise<{ stored: boolean; plaintext: boolean; reason?: string }> {
+  const r = (await Native.secureSet({ key, value, ...(opts.allowPlain ? { allowPlain: true } : {}) })) || {};
+  return { stored: r.stored !== false, plaintext: !!r.plaintext, reason: r.reason };
 }
 export async function secureGet(key: string): Promise<string | null> {
   return (await Native.secureGet({ key })).value ?? null;

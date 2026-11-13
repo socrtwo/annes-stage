@@ -14,7 +14,7 @@
  * with mock providers. src/ai/client.ts wires it into chat().
  */
 import type { ChatMessage, ChatRequest, ChatResult } from './client';
-import { AiError } from './errors';
+import { AiError, AI_TIMEOUT_MS } from './errors';
 
 export type EnsembleMode = 'single' | 'master' | 'consensus';
 export type Stance = 'unite' | 'stand-aside' | 'block';
@@ -36,7 +36,8 @@ export interface EnsembleSettings {
 
 export interface EnsembleMemberResult { provider: string; model: string; text?: string; error?: string; ms: number }
 export interface EnsembleResponse { provider: string; stance: Stance; reason?: string; suggestedChange?: string }
-export interface EnsembleRound { minute: string; responses: EnsembleResponse[] }
+/** `failed`: members that did not give a readable stance this round (an error, a timeout, or a reply that could not be read); they are not counted. */
+export interface EnsembleRound { minute: string; responses: EnsembleResponse[]; failed?: { provider: string; error: string }[] }
 
 /** Added to ChatResult when an ensemble answered. */
 export interface EnsembleInfo {
@@ -164,19 +165,37 @@ function revisePrompt(block: string, minute: string, blocks: EnsembleResponse[],
   ].filter(Boolean).join('\n\n');
 }
 
-/** Reads a member's JSON stance. Unreadable replies count as "unite" with a note. */
+/** The stance keyword itself ("unite", "stand aside", "block"), in any spelling a model uses; null for anything else. */
+function stanceWord(v: unknown): Stance | null {
+  const raw = String(v ?? '').trim().toLowerCase().replace(/[^a-z]+/g, '-').replace(/^-+|-+$/g, '');
+  if (raw === 'unite' || raw === 'united' || raw === 'unity') return 'unite';
+  if (raw === 'block' || raw === 'blocks' || raw === 'blocked') return 'block';
+  if (raw === 'stand-aside' || raw === 'standaside' || raw === 'stand-asides' || raw === 'stands-aside' || raw === 'stand-aside-s') return 'stand-aside';
+  return null;
+}
+
+/**
+ * Reads a member's stance. The JSON reply asked for comes first; a reply that is not JSON counts only
+ * when it is just the keyword (or "Stance: …"). Prose such as "I must block this" is not guessed at:
+ * it is unreadable, and unreadable replies are not counted as uniting.
+ */
 export function parseStance(text: string): { stance: Stance; reason?: string; suggestedChange?: string; unreadable?: boolean } {
-  const t = String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/```[a-z]*\n?/gi, '');
-  let j: any = null;
-  for (const m of [t.match(/\{[\s\S]*\}/), t.match(/\{[\s\S]*?\}/)]) {
-    if (!m) continue;
-    try { j = JSON.parse(m[0]); break; } catch { /* try the shorter match */ }
-  }
-  const raw = String(j?.stance ?? '').trim().toLowerCase().replace(/[\s_]+/g, '-');
-  const stance: Stance | null = raw === 'unite' || raw === 'block' || raw === 'stand-aside' ? raw : raw === 'standaside' || raw === 'stand-aside.' ? 'stand-aside' : null;
-  if (!stance) return { stance: 'unite', reason: 'Its reply could not be read, so it counts as uniting.', unreadable: true };
+  const t = String(text || '').replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '').replace(/```[a-z]*\n?/gi, '').trim();
   const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, 2000) : undefined);
-  return { stance, reason: str(j.reason), suggestedChange: str(j.suggested_change ?? j.suggestedChange) };
+  // Every {...} candidate, shortest first from each opening brace, until one parses with a stance.
+  for (let i = t.indexOf('{'); i >= 0; i = t.indexOf('{', i + 1)) {
+    for (let k = t.indexOf('}', i); k > i; k = t.indexOf('}', k + 1)) {
+      let j: any;
+      try { j = JSON.parse(t.slice(i, k + 1)); } catch { continue; }
+      if (!j || typeof j !== 'object') break;
+      const stance = stanceWord(j.stance);
+      if (!stance) break;
+      return { stance, reason: str(j.reason), suggestedChange: str(j.suggested_change ?? j.suggestedChange) };
+    }
+  }
+  const bare = /^(?:stance\s*[:=-]\s*)?["'*]*\s*(unite|stand[\s_-]?aside|block)\s*["'*]*\s*[.!]?\s*(?:\n([\s\S]*))?$/i.exec(t);
+  if (bare) return { stance: stanceWord(bare[1])!, reason: str(bare[2]) };
+  return { stance: 'stand-aside', reason: 'Its reply could not be read, so it is not counted.', unreadable: true };
 }
 
 // ------------------------------------------------------------------------------------------
@@ -238,6 +257,8 @@ export async function runEnsemble(req: ChatRequest, plan: EnsemblePlan, call: Me
   };
   const checkStop = () => { if (outer?.aborted) throw stopped(); };
   const base: ChatRequest = { messages: req.messages, tier: req.tier, temperature: req.temperature, maxTokens: req.maxTokens };
+  /** The master and clerk have no member timeout, but still give up eventually (and Stop always works). */
+  const leadTimeout = Math.max(AI_TIMEOUT_MS, plan.memberTimeoutMs);
   const n = plan.members.length;
 
   // Round 0: every member answers on its own.
@@ -297,7 +318,7 @@ export async function runEnsemble(req: ChatRequest, plan: EnsemblePlan, call: Me
   if (plan.mode === 'master') {
     status(`${name(master.provider)} is combining ${okIdx.length} answers…`);
     let r: ChatResult;
-    try { r = await ask(master, { ...base, messages: withPrompt(`${MASTER_PROMPT}\n\n${block}`), onToken: req.onToken }, 0); } catch (e) { return fallback(e, 'master'); }
+    try { r = await ask(master, { ...base, messages: withPrompt(`${MASTER_PROMPT}\n\n${block}`), onToken: req.onToken }, leadTimeout); } catch (e) { return fallback(e, 'master'); }
     add(r);
     checkStop();
     return { ...r, ...total(), ensemble: { mode: 'master', members, outcome: 'synthesized', master: master.provider, ...(failNote ? { note: failNote.trim() } : {}) } };
@@ -307,7 +328,7 @@ export async function runEnsemble(req: ChatRequest, plan: EnsemblePlan, call: Me
   status(`The clerk, ${name(master.provider)}, is drafting a minute…`);
   let clerk: ChatResult;
   try {
-    clerk = await ask(master, { ...base, messages: withPrompt(`${MASTER_PROMPT} ${DRAFT_NOTE}\n\n${block}`) }, 0);
+    clerk = await ask(master, { ...base, messages: withPrompt(`${MASTER_PROMPT} ${DRAFT_NOTE}\n\n${block}`) }, leadTimeout);
     if (!clerk.text.trim()) throw new AiError('The minute was empty.');
   } catch (e) { return fallback(e, 'clerk'); }
   add(clerk);
@@ -321,25 +342,35 @@ export async function runEnsemble(req: ChatRequest, plan: EnsemblePlan, call: Me
   let asides: EnsembleResponse[] = [];
   for (let round = 1; round <= plan.maxRounds; round++) {
     status(`Round ${round} of ${plan.maxRounds}: asking ${plural(voters.length, 'AI')}…`);
+    const failedVoters: { provider: string; error: string }[] = [];
     const replies = await Promise.all(voters.map(async (m) => {
       try {
-        const r = await ask(m, { ...base, temperature: 0, maxTokens: Math.max(400, Math.min(req.maxTokens || 1200, 1200)), messages: withPrompt(stancePrompt(block, minute)) }, plan.memberTimeoutMs);
+        // No temperature here: several models refuse temperature 0 (or any temperature), and a refused stance call would silently drop the member.
+        const r = await ask(m, { ...base, temperature: undefined, maxTokens: Math.max(400, Math.min(req.maxTokens || 1200, 1200)), messages: withPrompt(stancePrompt(block, minute)) }, plan.memberTimeoutMs);
         add(r);
         const s = parseStance(r.text);
+        if (s.unreadable) { failedVoters.push({ provider: m.provider, error: 'Its reply could not be read as unite, stand aside or block.' }); return null; }
         const resp: EnsembleResponse = { provider: m.provider, stance: s.stance };
         if (s.reason) resp.reason = s.reason;
         if (s.suggestedChange) resp.suggestedChange = s.suggestedChange;
         return resp;
       } catch (e) {
         if (isAbort(e) && outer?.aborted) throw e;
+        failedVoters.push({ provider: m.provider, error: e instanceof Error ? e.message : String(e) });
         return null; // left out of this round
       }
     }));
     checkStop();
     const responses = replies.filter((x): x is EnsembleResponse => !!x);
-    rounds.push({ minute, responses });
+    rounds.push(failedVoters.length ? { minute, responses, failed: failedVoters } : { minute, responses });
     blocks = responses.filter((x) => x.stance === 'block');
     asides = responses.filter((x) => x.stance === 'stand-aside');
+    if (!responses.length || (failedVoters.length && !blocks.length)) {
+      // Unity needs every member to be heard: silence or an unreadable reply is not agreement.
+      outcome = 'no-unity';
+      status(responses.length ? `Round ${round} of ${plan.maxRounds}: ${plural(failedVoters.length, 'AI')} gave no readable answer` : `Round ${round} of ${plan.maxRounds}: no AI gave a readable answer`);
+      break;
+    }
     if (!blocks.length) {
       outcome = asides.length ? 'unity-with-stand-asides' : 'unity';
       status(asides.length ? `United; ${asides.length} stood aside` : `United (${responses.length} of ${responses.length})`);
@@ -349,7 +380,7 @@ export async function runEnsemble(req: ChatRequest, plan: EnsemblePlan, call: Me
     if (round === plan.maxRounds) { outcome = 'no-unity'; break; }
     status(`The clerk, ${name(master.provider)}, is revising the minute…`);
     let rev: ChatResult;
-    try { rev = await ask(master, { ...base, messages: withPrompt(revisePrompt(block, minute, blocks, asides)) }, 0); } catch (e) {
+    try { rev = await ask(master, { ...base, messages: withPrompt(revisePrompt(block, minute, blocks, asides)) }, leadTimeout); } catch (e) {
       if (isAbort(e) || outer?.aborted) throw e;
       clerkNote = `The clerk could not revise the minute (${e instanceof Error ? e.message : String(e)}).`;
       outcome = 'no-unity';
@@ -366,7 +397,9 @@ export async function runEnsemble(req: ChatRequest, plan: EnsemblePlan, call: Me
   if (asides.length) info.standAsides = reasons(asides);
   if (outcome === 'no-unity') info.blocks = reasons(blocks);
   const lastRound = rounds[rounds.length - 1];
-  if (lastRound && !lastRound.responses.length) info.note = 'No AI could be reached to consider the minute; the clerk\'s minute is used.';
+  const failedText = (xs: { provider: string; error: string }[]) => xs.map((x) => `${name(x.provider)}: ${x.error}`).join(' · ');
+  if (lastRound && !lastRound.responses.length) info.note = `No AI gave a readable answer about the minute, so there is no unity; the clerk's minute is shown.${lastRound.failed?.length ? ` (${failedText(lastRound.failed)})` : ''}`;
+  else if (lastRound?.failed?.length) info.note = `${outcome === 'no-unity' && !blocks.length ? 'Unity could not be confirmed because not every AI gave a readable answer. ' : ''}Not counted: ${failedText(lastRound.failed)}.`;
   if (clerkNote) info.note = `${info.note ? info.note + ' ' : ''}${clerkNote}`;
   if (failNote) info.note = `${info.note ? info.note + ' ' : ''}${failNote.trim()}`;
   return { ...clerk, text: minute, ...total(), ensemble: info };
@@ -379,6 +412,10 @@ export function outcomeLine(info: EnsembleInfo, name: (provider: string) => stri
     case 'synthesized': return `Synthesized by ${name(info.master)}`;
     case 'unity': { const k = last?.responses.length ?? info.members.filter((m) => m.text != null).length; return `United (${k} of ${k})`; }
     case 'unity-with-stand-asides': return `United; ${info.standAsides?.length || 0} stood aside`;
-    case 'no-unity': return `No unity after ${plural(info.rounds?.length || 0, 'round')}: ${plural(info.blocks?.length || 0, 'objection')}`;
+    case 'no-unity': {
+      if (!info.blocks?.length && last && !last.responses.length) return 'No unity: no AI gave a readable answer about the minute';
+      if (!info.blocks?.length && last?.failed?.length) return `No unity: ${plural(last.failed.length, 'AI')} gave no readable answer about the minute`;
+      return `No unity after ${plural(info.rounds?.length || 0, 'round')}: ${plural(info.blocks?.length || 0, 'objection')}`;
+    }
   }
 }

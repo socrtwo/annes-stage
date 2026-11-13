@@ -4,7 +4,7 @@
 
 An original, open-source presentation app for Android, iOS, Windows, macOS, Linux, ChromeOS and the web whose goal is the same as the rest of the Anne's Office suite: **no missing commands**. Anne's Stage gives you a familiar slide workflow (outline, slide sorter, masters, transitions, animations, presenter view) and open and save .pptx and .odp files faithfully, then add the best ideas from forty years of presentation software: outline-driven authoring, a zoomable canvas mode, Markdown slides, build-order editing, rehearsal coaching, live polls and Q&A, and an optional AI tab that can run entirely on your device. Every feature is a command, and every command can be put on the Quick Access Bar, on your own tab, on a keyboard shortcut, or in a macro, and found with command search. When a presentation is damaged, Anne's Stage recovers what it can instead of refusing to open it.
 
-> **Status: first working version (0.1.0, milestone M1 with much of M2–M5).** The app builds for the web, Android, iOS and desktop with the same CI and release workflows as Anne's Grid. What works today:
+> **Status: version 0.2.0 (milestone M1 with much of M2–M5).** The app builds for the web, Android, iOS and desktop with the same CI and release workflows as Anne's Grid. What works today:
 >
 > - **556 commands**; 464 of the 755 ids in the plan are implemented, and the rest are listed in [docs/COMMANDS.md](docs/COMMANDS.md). A command is registered only when it works.
 > - **Editing:** placeholders inherit from layouts and masters; you type directly on the slide; 90+ preset shapes, pictures, tables, charts, diagrams, media, groups, ink; smart guides and snapping; undo/redo.
@@ -66,7 +66,7 @@ CI will type-check, test and build the web app and an APK on every push, and a *
 | **Anne's Pen** | Word processor | https://github.com/socrtwo/QuillPen |
 | **Anne's Grid** | Spreadsheet | https://github.com/socrtwo/QuillGrid |
 | **Anne's Post** | Email | https://github.com/socrtwo/QuillPost |
-| **Anne's Stage** | Presentations (this project) | https://github.com/socrtwo/QuillStage |
+| **Anne's Stage** | Presentations (this project) | https://github.com/socrtwo/annes-stage |
 
 The apps share one application shell: the command registry, Quick Access Bar, customizable tabs and keyboard, command search, macro recorder, AI setup wizard and providers, spelling dictionaries, recovery engine and platform layer. Anne's Stage plans to link charts from Anne's Grid workbooks, send outlines and handouts to Anne's Pen, and share decks through Anne's Post.
 

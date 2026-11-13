@@ -87,9 +87,13 @@ prevents adoption).
    `{"stance":"unite"|"stand-aside"|"block","reason":"…","suggested_change":"…"}`
    (prompt: "Unite if the minute is a correct, complete answer you can support. Stand aside if you
    prefer something different but the minute is acceptable; give your concern. Block only if the
-   minute is wrong or harmful; explain exactly what must change.") Unparseable replies count as
-   "unite" with a note; failed members are left out of the round.
-4. No blocks → adopt the minute. Outcome `unity` or `unity-with-stand-asides`.
+   minute is wrong or harmful; explain exactly what must change.") Stance calls are sent without a
+   temperature (several models refuse one). A reply counts only when it is that JSON or just the
+   keyword; prose ("I must block this") is unreadable. Unreadable replies and failed calls are not
+   counted; each is recorded in the round (`failed`: provider and error).
+4. No blocks and every member heard → adopt the minute. Outcome `unity` or
+   `unity-with-stand-asides`. No readable stance at all, or some members not heard → `no-unity`
+   (silence is not agreement); the clerk's minute is returned and the note names who was not heard.
 5. Blocks → the clerk revises the minute, given the blocks and stand-aside concerns ("Revise the
    minute to meet these objections where they are right; keep the original format requirements").
    Next round.

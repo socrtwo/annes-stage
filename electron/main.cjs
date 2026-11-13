@@ -104,8 +104,19 @@ function flushPendingFiles() {
 const secureFile = () => path.join(app.getPath('userData'), 'secure.json');
 function readSecure() { try { return JSON.parse(fs.readFileSync(secureFile(), 'utf8')); } catch { return {}; } }
 function writeSecure(o) { fs.writeFileSync(secureFile(), JSON.stringify(o), { mode: 0o600 }); }
+/**
+ * Whether safeStorage really encrypts. On Linux without a secret service (GNOME Keyring, KWallet)
+ * Electron falls back to the 'basic_text' backend, which only obfuscates with a fixed key.
+ */
+function canEncrypt() {
+  if (!safeStorage.isEncryptionAvailable()) return false;
+  try {
+    if (process.platform === 'linux' && typeof safeStorage.getSelectedStorageBackend === 'function' && safeStorage.getSelectedStorageBackend() === 'basic_text') return false;
+  } catch { /* older Electron: trust isEncryptionAvailable */ }
+  return true;
+}
 function seal(v) {
-  return safeStorage.isEncryptionAvailable() ? { enc: true, v: safeStorage.encryptString(v).toString('base64') } : { enc: false, v };
+  return { enc: true, v: safeStorage.encryptString(v).toString('base64') };
 }
 function unseal(rec) {
   if (!rec) return null;
@@ -122,12 +133,22 @@ function stopLoop() { if (loop) { clearTimeout(loop.timer); try { loop.server.cl
 // IPC
 
 const safeUrl = (u) => typeof u === 'string' && /^(https?|mailto|tel|ftp|sms|geo):/i.test(u.trim());
+/**
+ * The app's own origin exactly (not a prefix: "app://quillstage.evil" must not pass). Node's URL
+ * reports the origin of a custom scheme as "null", so scheme and host are compared instead.
+ */
+function isAppUrl(u) {
+  try { const x = new URL(String(u)); return x.protocol === SCHEME + ':' && x.host === new URL(ORIGIN).host; } catch { return false; }
+}
 function handle(name, fn) {
   ipcMain.handle('ql:' + name, async (e, opts) => {
-    if (!win || e.sender !== win.webContents || !e.senderFrame || !e.senderFrame.url.startsWith(ORIGIN)) throw new Error('Refused');
+    if (!win || e.sender !== win.webContents || !e.senderFrame || !isAppUrl(e.senderFrame.url)) throw new Error('Refused');
     return fn(opts || {});
   });
 }
+/** AI requests in flight through the http bridge, by the id the renderer gave them (Stop cancels them). */
+const httpRequests = new Map();
+const HTTP_TIMEOUT_MS = 180000;
 
 function registerIpc() {
   handle('openDocument', async () => {
@@ -175,7 +196,16 @@ function registerIpc() {
     if (on && wakeId < 0) wakeId = powerSaveBlocker.start('prevent-display-sleep');
     if (!on && wakeId >= 0) { powerSaveBlocker.stop(wakeId); wakeId = -1; }
   });
-  handle('secureSet', async ({ key, value }) => { const o = readSecure(); o[String(key)] = seal(String(value)); writeSecure(o); });
+  // Without real encryption the key is not written unless the user agreed (allowPlain): the renderer
+  // warns and otherwise keeps the key for this session only.
+  handle('secureSet', async ({ key, value, allowPlain }) => {
+    const encrypt = canEncrypt();
+    if (!encrypt && allowPlain !== true) return { stored: false, reason: 'no-encryption' };
+    const o = readSecure();
+    o[String(key)] = encrypt ? seal(String(value)) : { enc: false, v: String(value) };
+    writeSecure(o);
+    return { stored: true, plaintext: !encrypt };
+  });
   handle('secureGet', async ({ key }) => { try { return { value: unseal(readSecure()[String(key)]) }; } catch { return { value: null }; } });
   handle('secureRemove', async ({ key }) => { const o = readSecure(); delete o[String(key)]; writeSecure(o); });
   handle('readClipboard', async () => ({ text: clipboard.readText() }));
@@ -210,11 +240,26 @@ function registerIpc() {
     const err = await shell.openPath(file);
     return err ? { ok: false, error: err } : { ok: true };
   });
-  handle('http', async ({ url, method, headers, data }) => {
+  handle('http', async ({ url, method, headers, data, id, timeoutMs }) => {
     if (typeof url !== 'string' || !/^https:\/\//i.test(url)) throw new Error('Only https requests are allowed');
-    const res = await net.fetch(url, { method: method || 'GET', headers: headers || {}, body: data == null ? undefined : typeof data === 'string' ? data : JSON.stringify(data) });
-    return { status: res.status, text: await res.text() };
+    const ctl = new AbortController();
+    const ms = Math.min(Math.max(Number(timeoutMs) || HTTP_TIMEOUT_MS, 1000), 600000);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, ms);
+    const key = typeof id === 'string' && id ? id.slice(0, 64) : null;
+    if (key) httpRequests.set(key, ctl);
+    try {
+      const res = await net.fetch(url, { method: method || 'GET', headers: headers || {}, body: data == null ? undefined : typeof data === 'string' ? data : JSON.stringify(data), signal: ctl.signal });
+      return { status: res.status, text: await res.text() };
+    } catch (err) {
+      if (ctl.signal.aborted) throw new Error(timedOut ? `No answer within ${Math.round(ms / 1000)} seconds` : 'Stopped');
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      if (key) httpRequests.delete(key);
+    }
   });
+  handle('httpAbort', async ({ id }) => { const ctl = httpRequests.get(String(id)); if (ctl) ctl.abort(); });
 }
 
 // ------------------------------------------------------------------------------------------
@@ -240,7 +285,8 @@ const CSP = [
 function serveApp() {
   protocol.handle(SCHEME, async (req) => {
     const u = new URL(req.url);
-    const rel = decodeURIComponent(u.pathname).replace(/^\/+/, '') || 'index.html';
+    let rel;
+    try { rel = decodeURIComponent(u.pathname).replace(/^\/+/, '') || 'index.html'; } catch { return new Response('Bad Request', { status: 400 }); }
     const file = path.resolve(DIST, rel);
     if (!file.startsWith(DIST + path.sep) && file !== DIST) return new Response('Forbidden', { status: 403 });
     const target = fs.existsSync(file) && fs.statSync(file).isFile() ? file : path.join(DIST, 'index.html');
@@ -302,7 +348,7 @@ function createWindow() {
     if (safeUrl(url)) void shell.openExternal(url);
     return { action: 'deny' };
   });
-  win.webContents.on('will-navigate', (e, url) => { if (!url.startsWith(ORIGIN)) { e.preventDefault(); if (safeUrl(url)) void shell.openExternal(url); } });
+  // will-navigate for this window (and every other one) is handled in 'web-contents-created' below.
   // The page asks before unloading with unsaved presentations: confirm here, as the browser would.
   win.webContents.on('will-prevent-unload', (e) => {
     const choice = dialog.showMessageBoxSync(win, { type: 'question', buttons: ['Close without saving', 'Cancel'], defaultId: 1, cancelId: 1, title: 'Unsaved changes', message: 'Some presentations have unsaved changes. Close Anne\'s Stage anyway?' });
@@ -313,6 +359,17 @@ function createWindow() {
   win.on('closed', () => { win = null; rendererReady = false; });
   void win.loadURL(`${ORIGIN}/index.html`);
 }
+
+// Every webContents (the main window, the audience window, anything else): no navigation away from
+// the app's own origin, no new windows (the main window replaces this handler with its own, which
+// allows only the audience view), no <webview>. External links go to the system browser.
+app.on('web-contents-created', (_e, wc) => {
+  const guard = (e, url) => { if (!isAppUrl(url)) { e.preventDefault(); if (safeUrl(url)) void shell.openExternal(url); } };
+  wc.on('will-navigate', guard);
+  wc.on('will-redirect', guard);
+  wc.on('will-attach-webview', (e) => e.preventDefault());
+  wc.setWindowOpenHandler(({ url }) => { if (safeUrl(url)) void shell.openExternal(url); return { action: 'deny' }; });
+});
 
 app.on('second-instance', (_e, argv) => {
   const p = fileFromArgs(argv);
