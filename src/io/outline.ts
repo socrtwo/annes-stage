@@ -7,6 +7,7 @@ import JSZip from 'jszip';
 import { Deck, textOf } from '../model/deck';
 import type { Paragraph, Run, ShapeElement, Slide } from '../model/types';
 import { attr, decodeXml, desc, kid, kids, parseXml } from './xml';
+import { inflateCapped, ZipBudget } from './zip';
 
 export interface OutlineItem { title: string; titleRuns?: Run[]; bullets: Paragraph[]; notes?: string; section?: string; layout?: 'title' | 'obj' | 'secHead' | 'titleOnly' | 'blank' }
 
@@ -78,12 +79,13 @@ export function textToDeck(text: string): Deck { return deckFromOutline(textToDe
 
 export async function importDocxOutline(data: Uint8Array): Promise<Deck> {
   const zip = await JSZip.loadAsync(data);
+  const budget = new ZipBudget();
   const docF = zip.file('word/document.xml');
   if (!docF) throw new Error('This Word document has no main part (word/document.xml).');
-  const doc = parseXml(decodeXml(await docF.async('uint8array')));
+  const doc = parseXml(decodeXml(await inflateCapped(docF, budget)));
   if (!doc) throw new Error('The Word document could not be read.');
   const stylesF = zip.file('word/styles.xml');
-  const styles = stylesF ? parseXml(decodeXml(await stylesF.async('uint8array'))) : null;
+  const styles = stylesF ? parseXml(decodeXml(await inflateCapped(stylesF, budget))) : null;
   const styleLevel = new Map<string, number>();
   for (const st of desc(styles, 'style')) {
     const id = attr(st, 'styleId') || '';

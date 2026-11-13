@@ -11,7 +11,7 @@ import { b64 } from './xml';
 
 const RT = {
   Document: 0x03e8, DocumentAtom: 0x03e9, Slide: 0x03ee, SlideAtom: 0x03ef, Notes: 0x03f0, SlidePersistAtom: 0x03f3, MainMaster: 0x03f8,
-  PPDrawing: 0x040c, SlideListWithText: 0x0ff0, TextHeaderAtom: 0x0f9f, TextCharsAtom: 0x0fa0, TextBytesAtom: 0x0fa8, StyleTextPropAtom: 0x0fa1,
+  PPDrawing: 0x040c, SlideListWithText: 0x0ff0, OutlineTextRefAtom: 0x0f9e, TitleMaster: 0x03f7, Handout: 0x0fc9, TextHeaderAtom: 0x0f9f, TextCharsAtom: 0x0fa0, TextBytesAtom: 0x0fa8, StyleTextPropAtom: 0x0fa1,
   PersistDirectoryAtom: 0x1772, UserEditAtom: 0x0ff5, OEPlaceholderAtom: 0x0bc3, CurrentUserAtom: 0x0ff6,
   DggContainer: 0xf000, BStoreContainer: 0xf001, DgContainer: 0xf002, SpgrContainer: 0xf003, SpContainer: 0xf004, FBSE: 0xf007, FSP: 0xf00a, FOPT: 0xf00b,
   ClientTextbox: 0xf00d, ClientAnchor: 0xf010, ClientData: 0xf011, ChildAnchor: 0xf00f,
@@ -60,7 +60,10 @@ const textOf = (b: Uint8Array, r: Rec): string => {
   return s;
 };
 
-interface PptShape { kind: 'text' | 'picture'; textType?: number; text?: string; rect?: [number, number, number, number]; ph?: number; pib?: number; pf?: PfRun[] }
+interface PptShape { kind: 'text' | 'picture'; textType?: number; text?: string; rect?: [number, number, number, number]; ph?: number; pib?: number; pf?: PfRun[]; /** Blip of a picture fill (fillBlip, 0x0186). */ fillPib?: number; /** Index of the SlideListWithText text this shape showed (OutlineTextRefAtom). */ listRef?: number }
+
+/** One text of a SlideListWithText entry: TextHeaderAtom type, its characters and paragraph runs. */
+export interface ListText { type: number; text: string; pf?: PfRun[] }
 
 interface PfRun { count: number; level: number; bullet?: string | null }
 
@@ -97,8 +100,12 @@ function paraRuns(b: Uint8Array, r: Rec, textLen: number): PfRun[] {
   return out;
 }
 
-/** Shapes of a slide, notes or master container: text boxes and pictures with their anchors. */
-function shapesOf(b: Uint8Array, container: Rec): PptShape[] {
+/**
+ * Shapes of a slide, notes or master container: text boxes and pictures with their anchors.
+ * PowerPoint keeps placeholder text in the SlideListWithText, not in the drawing: a ClientTextbox
+ * then holds an OutlineTextRefAtom whose index picks the slide's list text (with its styles).
+ */
+export function shapesOf(b: Uint8Array, container: Rec, listText: ListText[] = []): PptShape[] {
   const out: PptShape[] = [];
   const visit = (r: Rec, depth: number) => {
     if (r.type !== RT.SpContainer) return;
@@ -116,6 +123,7 @@ function shapesOf(b: Uint8Array, container: Rec): PptShape[] {
         for (let i = 0; i < n && k.data + i * 6 + 6 <= k.data + k.len; i++) {
           const id = le.u16(b, k.data + i * 6) & 0x3fff;
           if (id === 0x0104) { sh.pib = le.u32(b, k.data + i * 6 + 2); sh.kind = 'picture'; }
+          else if (id === 0x0186) sh.fillPib = le.u32(b, k.data + i * 6 + 2);
         }
       } else if (k.type === RT.ClientData) {
         walk(b, k, (c) => { if (c.type === RT.OEPlaceholderAtom && c.len >= 8) sh.ph = b[c.data + 4]; });
@@ -125,16 +133,45 @@ function shapesOf(b: Uint8Array, container: Rec): PptShape[] {
           if (c.type === RT.TextHeaderAtom && c.len >= 4) sh.textType = le.u32(b, c.data);
           else if (c.type === RT.TextCharsAtom || c.type === RT.TextBytesAtom) parts.push(textOf(b, c));
           else if (c.type === RT.StyleTextPropAtom && parts.length === 1 && !sh.pf) sh.pf = paraRuns(b, c, parts[0].length);
+          else if (c.type === RT.OutlineTextRefAtom && c.len >= 4 && sh.listRef == null) sh.listRef = le.i32(b, c.data);
         });
         if (parts.length) { sh.text = parts.join('\r'); sh.kind = 'text'; }
+        else if (sh.listRef != null && listText[sh.listRef]) {
+          const lt = listText[sh.listRef];
+          sh.text = lt.text; sh.kind = 'text';
+          if (sh.textType == null) sh.textType = lt.type;
+          if (lt.pf) sh.pf = lt.pf;
+        }
       }
     }
-    if (sh.text != null || sh.kind === 'picture') out.push(sh);
+    if (sh.text != null || sh.kind === 'picture' || sh.fillPib) out.push(sh);
     void depth;
   };
   walk(b, container, (r, d) => { visit(r, d); });
   return out;
 }
+
+/** Slide entries of a SlideListWithText: persist id and the texts (header type, characters, styles). */
+export function slideListTexts(b: Uint8Array, list: Rec): { persist: number; listText: ListText[] }[] {
+  const out: { persist: number; listText: ListText[] }[] = [];
+  let cur: { persist: number; listText: ListText[] } | null = null;
+  let group: ListText | null = null;
+  for (const k of children(b, list)) {
+    if (k.type === RT.SlidePersistAtom) { cur = { persist: le.u32(b, k.data), listText: [] }; out.push(cur); group = null; }
+    else if (!cur) continue;
+    else if (k.type === RT.TextHeaderAtom) { group = { type: le.u32(b, k.data), text: '' }; cur.listText.push(group); }
+    else if (k.type === RT.TextCharsAtom || k.type === RT.TextBytesAtom) {
+      const prev = group as ListText | null;
+      const g: ListText = prev && !prev.text ? prev : { type: prev ? prev.type : 4, text: '' };
+      if (g !== prev) { cur.listText.push(g); group = g; }
+      g.text = textOf(b, k);
+    } else if (k.type === RT.StyleTextPropAtom && group && !group.pf) group.pf = paraRuns(b, k, group.text.length);
+  }
+  return out;
+}
+
+/** Record header at an offset (exported for tests). */
+export const pptRecord = rec;
 
 export interface PptImportResult { deck: Deck; warnings: string[]; damaged: boolean; textOnly?: boolean }
 
@@ -279,8 +316,9 @@ export async function importPpt(data: Uint8Array): Promise<PptImportResult> {
   const mediaIds = pics.map((p) => (p ? deck.addMedia({ mime: p.mime, b64: b64(p.data) }) : ''));
   const used = new Set<number>();
 
-  // Slide order from the slide list; text atoms listed there serve when the drawing has none.
-  type SlideRef = { persist: number; listText: { type: number; text: string }[] };
+  // Slide order from the slide list; its texts are what OutlineTextRefAtoms point at, and they
+  // also serve when the drawing has no text at all.
+  type SlideRef = { persist: number; listText: ListText[] };
   const slideRefs: SlideRef[] = [];
   /** Notes id (from SlideAtom.notesIdRef) → persist id. */
   const notesPersist = new Map<number, number>();
@@ -290,22 +328,16 @@ export async function importPpt(data: Uint8Array): Promise<PptImportResult> {
         for (const k of children(doc, c)) if (k.type === RT.SlidePersistAtom && k.len >= 16) notesPersist.set(le.u32(doc, k.data + 12), le.u32(doc, k.data));
       }
       if (c.type !== RT.SlideListWithText || c.inst !== 0) continue;
-      let cur: SlideRef | null = null;
-      let ttype = 4;
-      for (const k of children(doc, c)) {
-        if (k.type === RT.SlidePersistAtom) { cur = { persist: le.u32(doc, k.data), listText: [] }; slideRefs.push(cur); }
-        else if (k.type === RT.TextHeaderAtom) ttype = le.u32(doc, k.data);
-        else if ((k.type === RT.TextCharsAtom || k.type === RT.TextBytesAtom) && cur) cur.listText.push({ type: ttype, text: textOf(doc, k) });
-      }
+      for (const ref of slideListTexts(doc, c)) slideRefs.push(ref);
     }
   }
   const toPt = (v: number) => v / 8;
-  const build = (container: Rec | null, listText: { type: number; text: string }[]): { slide: Slide; notesRef: number } => {
-    const shapes = container ? shapesOf(doc, container) : [];
+  const build = (container: Rec | null, listText: ListText[]): { slide: Slide; notesRef: number } => {
+    const shapes = container ? shapesOf(doc, container, listText) : [];
     const els: Element[] = [];
     let hasTitle = false, hasCtr = false;
     const texts = shapes.filter((s) => s.kind === 'text');
-    const source: PptShape[] = texts.length ? texts : listText.map((t) => ({ kind: 'text' as const, textType: t.type, text: t.text }));
+    const source: PptShape[] = texts.length ? texts : listText.map((t) => ({ kind: 'text' as const, textType: t.type, text: t.text, pf: t.pf }));
     const hasSub = source.some((s) => (s.ph != null && PH_SUB.has(s.ph)) || s.textType === 5);
     for (const s of source) {
       const isTitle = (s.ph != null && PH_TITLE.has(s.ph)) || (s.ph == null && TITLE_TYPES.has(s.textType ?? -1));
@@ -322,6 +354,7 @@ export async function importPpt(data: Uint8Array): Promise<PptImportResult> {
       els.push(el);
     }
     for (const s of shapes) {
+      if (s.fillPib) used.add(s.fillPib - 1);
       if (s.kind !== 'picture' || !s.pib || !mediaIds[s.pib - 1]) continue;
       used.add(s.pib - 1);
       const pic: PictureElement = { id: newId('pic'), kind: 'picture', media: mediaIds[s.pib - 1] };
@@ -358,8 +391,14 @@ export async function importPpt(data: Uint8Array): Promise<PptImportResult> {
     damaged = true;
     for (const t of tops) if (t.type === RT.Slide) deck.data.slides.push(build(t, []).slide);
   }
+  // Pictures shown by masters, title masters, notes and handouts, or used as picture fills, are
+  // accounted for; any other unplaced picture is surfaced only when the file is damaged.
+  for (const t of tops) {
+    if (t.type !== RT.MainMaster && t.type !== RT.TitleMaster && t.type !== RT.Notes && t.type !== RT.Handout && t.type !== RT.Slide) continue;
+    for (const sh of shapesOf(doc, t)) { if (sh.pib) used.add(sh.pib - 1); if (sh.fillPib) used.add(sh.fillPib - 1); }
+  }
   const orphans = mediaIds.map((id, i) => ({ id, i })).filter((x) => x.id && !used.has(x.i));
-  if (orphans.length) {
+  if (orphans.length && damaged) {
     const s = deck.makeSlide(lay('titleOnly'));
     (s.elements.find((e) => e.ph) as ShapeElement).text = { paras: [{ level: 0, runs: [{ text: 'Recovered pictures' }] }] };
     const cols = Math.ceil(Math.sqrt(orphans.length));

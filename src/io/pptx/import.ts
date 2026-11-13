@@ -3,7 +3,7 @@
  * by local name, so Strict and Transitional files and prefix variations read the same way. The
  * importer is lenient: a part that cannot be read is skipped with a warning, never fatal.
  */
-import JSZip from 'jszip';
+import { readZipCapped } from '../zip';
 import { Deck, newId, defaultStyles } from '../../model/deck';
 import type {
   Animation, AnimClass, AnimEffect, Bullet, ChartElement, ChartType, Color, DeckData, Effects, Element as SEl, Fill, GroupElement, Layout, LevelStyle, Line,
@@ -20,15 +20,28 @@ interface Rel { id: string; type: string; target: string; external: boolean }
 
 export interface PptxImportResult { deck: Deck; warnings: string[]; /** Parts that failed to parse. */ badParts: string[] }
 
-export async function readZip(data: Uint8Array): Promise<Pkg> {
-  const zip = await JSZip.loadAsync(data);
-  const pkg: Pkg = new Map();
-  for (const f of Object.values(zip.files)) if (!f.dir) pkg.set(f.name.replace(/^\/+/, ''), await f.async('uint8array'));
-  return pkg;
+/**
+ * Reads a package's parts with size caps: XML parts first, then only the binaries (media, fonts,
+ * macros) that some relationship names, so unreferenced or oversized entries are never inflated.
+ */
+export async function readZip(data: Uint8Array, warnings: string[] = []): Promise<Pkg> {
+  const r = await readZipCapped(data, {
+    rename: (n) => n.replace(/^\/+/, ''),
+    phase2: (files) => {
+      let rels = '';
+      for (const [k, v] of files) if (/\.rels$/i.test(k)) rels += decodeXml(v);
+      return (name) => { const base = name.split('/').pop() || name; return rels.includes(base) || rels.includes(encodeURI(base)); };
+    },
+  });
+  warnings.push(...r.warnings);
+  return r.files;
 }
 
 export async function importPptx(data: Uint8Array): Promise<PptxImportResult> {
-  return importPptxPkg(await readZip(data));
+  const zipWarnings: string[] = [];
+  const r = importPptxPkg(await readZip(data, zipWarnings));
+  r.warnings.push(...zipWarnings);
+  return r;
 }
 
 const PRESET_COLORS: Record<string, string> = { black: '#000000', white: '#FFFFFF', red: '#FF0000', green: '#008000', blue: '#0000FF', yellow: '#FFFF00', gray: '#808080', orange: '#FFA500', purple: '#800080', darkBlue: '#00008B', darkRed: '#8B0000', lightGray: '#D3D3D3', darkGray: '#A9A9A9', cyan: '#00FFFF', magenta: '#FF00FF' };
@@ -65,6 +78,9 @@ export function parseColor(container: Element | null | undefined): Color | undef
   return { s: base, ...(lum ? { lum: +lum.toFixed(3) } : {}), ...(alpha != null ? { alpha } : {}) };
 }
 
+/** Most data points read from one chart cache. */
+const CHART_MAX_POINTS = 10000;
+
 const ALGN: Record<string, ParaProps['align']> = { l: 'l', ctr: 'ctr', r: 'r', just: 'just', justLow: 'just', dist: 'dist', thaiDist: 'dist' };
 const AUTONUM: Record<string, NumScheme> = { arabicPeriod: 'arabicPeriod', arabicParenR: 'arabicParenR', arabicPlain: 'arabicPlain', alphaLcPeriod: 'alphaLcPeriod', alphaUcPeriod: 'alphaUcPeriod', alphaLcParenR: 'alphaLcParenR', alphaUcParenR: 'alphaUcPeriod', romanLcPeriod: 'romanLcPeriod', romanUcPeriod: 'romanUcPeriod', arabicParenBoth: 'arabicParenR' };
 
@@ -75,6 +91,8 @@ class Importer {
   private docs = new Map<string, Document | null>();
   private relCache = new Map<string, Rel[]>();
   private mediaByPart = new Map<string, string>();
+  /** Element ids already given out, per id prefix (one per part). */
+  private usedIds = new Map<string, Set<string>>();
   /** Theme fill styles of the current master's theme (for fillRef). */
   constructor(public pkg: Pkg) {}
 
@@ -229,7 +247,13 @@ class Importer {
       if (maj) th.fonts.major = maj;
       if (min) th.fonts.minor = min;
       const fmt = firstDesc(d, 'fmtScheme');
-      if (fmt) th.keep.fmtScheme = new XMLSerializer().serializeToString(fmt);
+      // Keep the format scheme verbatim unless it points at package parts (blip fills): the
+      // theme's relationships and media are not carried, so such a scheme falls back to the default.
+      if (fmt) {
+        const x = new XMLSerializer().serializeToString(fmt);
+        if (/\br:(embed|link|id)=|:(embed|link)="rId/.test(x)) this.warnings.push('The theme\'s picture fill styles were replaced by the default format scheme.');
+        else th.keep.fmtScheme = x;
+      }
     }
     this.deck.data.themes.push(th);
     return th;
@@ -384,7 +408,14 @@ class Importer {
     const kind = node.localName;
     if (!['sp', 'cxnSp', 'pic', 'grpSp', 'graphicFrame'].includes(kind)) return null;
     const nv = this.nv(node);
-    const base: any = { id: `${ctx.prefix}${nv.id}` };
+    // Shape ids must be unique within a part; a repeated cNvPr id gets a suffix. Animation and
+    // connector references (spid, stCxn) keep resolving to the first shape with that id.
+    let uid = `${ctx.prefix}${nv.id}`;
+    let used = this.usedIds.get(ctx.prefix);
+    if (!used) { used = new Set(); this.usedIds.set(ctx.prefix, used); }
+    if (used.has(uid)) { let k = 2; while (used.has(`${uid}_${k}`)) k++; uid = `${uid}_${k}`; }
+    used.add(uid);
+    const base: any = { id: uid };
     if (nv.name) base.name = nv.name;
     if (nv.alt) base.alt = nv.alt;
     if (nv.title) base.title = nv.title;
@@ -797,8 +828,15 @@ class Importer {
     const grouping = attr(kid(typeEl, 'grouping'), 'val');
     const cache = (e: Element | null) => {
       const pts = desc(e, 'pt');
+      // idx is bounded by the cache's ptCount (and a sane maximum) so a bogus index cannot allocate a huge array.
+      const declared = num(firstDesc(e, 'ptCount'), 'val');
+      const max = Math.min(CHART_MAX_POINTS, declared != null && declared >= 0 ? declared : Math.max(pts.length, 1) * 4);
       const out: string[] = [];
-      for (const p of pts) out[num(p, 'idx') || 0] = kid(p, 'v')?.textContent ?? '';
+      for (const p of pts) {
+        const idx = Math.floor(num(p, 'idx') || 0);
+        if (idx < 0 || idx >= max) continue;
+        out[idx] = kid(p, 'v')?.textContent ?? '';
+      }
       return out;
     };
     let categories: string[] = [];
@@ -856,7 +894,12 @@ class Importer {
       const d = ({ l: 'l', r: 'r', u: 'u', d: 'd', in: 'in', out: 'out', lu: 'lu', ru: 'ru', ld: 'ld', rd: 'rd', horz: 'horz', vert: 'vert' } as any)[dir];
       if (d) t.dir = d;
     }
-    if (t.type === 'split') { const o = attr(eff, 'orient'); if (o === 'vert' || o === 'horz') t.dir = (attr(eff, 'dir') === 'in' ? o : o) as any; }
+    if (t.type === 'split') {
+      // Split keeps its orientation in dir and whether it closes in or opens out separately.
+      const o = attr(eff, 'orient');
+      t.dir = o === 'vert' ? 'vert' : 'horz';
+      if (dir === 'in' || dir === 'out') t.inOut = dir;
+    }
     if (attr(eff, 'thruBlk') === '1') t.thruBlk = true;
     return t;
   }

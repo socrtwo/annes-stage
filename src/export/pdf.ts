@@ -30,6 +30,16 @@ export interface PdfOptions {
   /** Renders a slide (after `step` build steps, or fully built) to JPEG bytes. Defaults to slidePng. */
   render?: (slide: Slide, step: number | undefined, widthPx: number) => Promise<Uint8Array>;
   onProgress?: (done: number, total: number) => void;
+  /**
+   * Called (once per distinct message) when text the standard PDF fonts cannot show had to be
+   * drawn as a picture or, without a canvas, replaced by "?". Defaults to console.warn.
+   */
+  onWarning?: (message: string) => void;
+  /**
+   * Draws one line of text the WinAnsi fonts cannot encode, as JPEG bytes at `scale` pixels per
+   * point. Defaults to a canvas renderer when a canvas is available; return null to fall back to "?".
+   */
+  rasterText?: (text: string, size: number, bold: boolean, scale: number) => Promise<{ jpeg: Uint8Array; w: number; h: number } | null>;
 }
 
 const PAPER = { letter: [612, 792], a4: [595.28, 841.89] } as const;
@@ -46,6 +56,16 @@ export function textWidth(s: string, size: number, bold = false): number {
 
 // WinAnsi (cp1252) code points for 0x80–0x9F.
 const CP1252: Record<number, number> = { 0x20ac: 0x80, 0x201a: 0x82, 0x0192: 0x83, 0x201e: 0x84, 0x2026: 0x85, 0x2020: 0x86, 0x2021: 0x87, 0x02c6: 0x88, 0x2030: 0x89, 0x0160: 0x8a, 0x2039: 0x8b, 0x0152: 0x8c, 0x017d: 0x8e, 0x2018: 0x91, 0x2019: 0x92, 0x201c: 0x93, 0x201d: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97, 0x02dc: 0x98, 0x2122: 0x99, 0x0161: 0x9a, 0x203a: 0x9b, 0x0153: 0x9c, 0x017e: 0x9e, 0x0178: 0x9f };
+
+/** True when every character of `s` has a WinAnsi (cp1252) code, so the standard fonts can show it. */
+export function winAnsiEncodable(s: string): boolean {
+  for (const ch of s) {
+    const c = ch.codePointAt(0)!;
+    if (c < 32 && c !== 9 && c !== 10 && c !== 13) continue;
+    if ((c > 255 || (c >= 0x80 && c < 0xa0)) && CP1252[c] == null) return false;
+  }
+  return true;
+}
 
 /** A PDF literal string in WinAnsi: characters outside the encoding become "?". */
 export function pdfText(s: string): string {
@@ -190,6 +210,27 @@ function handoutGrid(n: number): [number, number, boolean] {
   switch (n) { case 1: return [1, 1, false]; case 2: return [1, 2, false]; case 3: return [1, 3, true]; case 4: return [2, 2, false]; case 6: return [2, 3, false]; default: return [3, 3, false]; }
 }
 
+/** Canvas renderer for lines the standard fonts cannot encode (null without a canvas). */
+async function canvasRasterText(text: string, size: number, bold: boolean, scale: number): Promise<{ jpeg: Uint8Array; w: number; h: number } | null> {
+  if (typeof document === 'undefined') return null;
+  let canvas: HTMLCanvasElement;
+  let g: CanvasRenderingContext2D | null;
+  try { canvas = document.createElement('canvas'); g = canvas.getContext('2d'); } catch { return null; }
+  if (!g) return null;
+  const font = `${bold ? 'bold ' : ''}${size * scale}px Carlito, Arimo, Helvetica, Arial, "Noto Sans", sans-serif`;
+  g.font = font;
+  const wPx = Math.max(1, Math.ceil(g.measureText(text).width) + 2);
+  const hPx = Math.max(1, Math.ceil(size * scale * 1.3));
+  canvas.width = Math.min(16384, wPx); canvas.height = hPx;
+  g = canvas.getContext('2d')!;
+  g.fillStyle = '#FFFFFF'; g.fillRect(0, 0, canvas.width, canvas.height);
+  g.fillStyle = '#000000'; g.font = font; g.textBaseline = 'alphabetic';
+  g.fillText(text, 1, Math.round(size * scale * 1.02));
+  const blob = await new Promise<Blob | null>((res) => { try { canvas.toBlob((b) => res(b), 'image/jpeg', 0.92); } catch { res(null); } });
+  if (!blob) return null;
+  return { jpeg: new Uint8Array(await blob.arrayBuffer()), w: canvas.width / scale, h: hPx / scale };
+}
+
 async function defaultRender(deck: Deck): Promise<NonNullable<PdfOptions['render']>> {
   const { slidePng } = await import('./images');
   return async (slide, step, width) => new Uint8Array(await (await slidePng(deck, slide, { width, type: 'image/jpeg', quality: 0.9, step })).arrayBuffer());
@@ -198,8 +239,27 @@ async function defaultRender(deck: Deck): Promise<NonNullable<PdfOptions['render
 export async function deckToPdf(deck: Deck, opts: PdfOptions = {}): Promise<Uint8Array> {
   const kind = opts.kind || 'slides';
   const slides = deck.slides.filter((s) => (opts.hidden || !s.hidden) && (!opts.slides?.length || opts.slides.includes(s.id)));
+  if (!slides.length) throw new Error('No slides to export: the presentation has no slides, or every chosen slide is hidden.');
   const render = opts.render || (kind === 'outline' ? null : await defaultRender(deck));
   const pdf = new PdfWriter();
+  // Text the WinAnsi fonts cannot encode (CJK, Greek, Cyrillic, emoji…) is drawn as a picture.
+  const warned = new Set<string>();
+  const warn = (m: string) => { if (warned.has(m)) return; warned.add(m); (opts.onWarning || ((x: string) => console.warn(x)))(m); };
+  const raster = opts.rasterText || canvasRasterText;
+  let rasterN = 0;
+  /** Text at (x, y) as PDF operators; non-encodable text becomes an image XObject in `images`. */
+  const textAt = async (x: number, y: number, size: number, s: string, images: Record<string, number>, bold = false, maxW = Infinity): Promise<string> => {
+    if (winAnsiEncodable(s)) return textOp(x, y, size, s, bold);
+    let r: { jpeg: Uint8Array; w: number; h: number } | null = null;
+    try { r = await raster(s, size, bold, 4); } catch { r = null; }
+    if (!r) { warn('Some characters cannot be shown by the PDF\'s standard fonts and were replaced by "?". Use Print ▸ Save as PDF to keep them.'); return textOp(x, y, size, s, bold); }
+    warn('Some text uses characters outside the PDF\'s standard fonts; those lines were drawn as pictures (not selectable).');
+    const name = `T${++rasterN}`;
+    images[name] = pdf.image(r.jpeg, { w: Math.round(r.w * 4), h: Math.round(r.h * 4) });
+    const k = r.w > maxW ? maxW / r.w : 1;
+    const w = r.w * k, h = r.h * k;
+    return `q ${num(w)} 0 0 ${num(h)} ${num(x)} ${num(y - h * 0.22)} cm /${name} Do Q\n`;
+  };
   const { w: SW, h: SH } = deck.size;
   const imgW = opts.imageWidth || (kind === 'slides' ? 1600 : 1000);
   const [PW, PH] = PAPER[opts.paper || 'letter'];
@@ -267,7 +327,7 @@ export async function deckToPdf(deck: Deck, opts: PdfOptions = {}): Promise<Uint
           pdf.page(PW, PH, content, images);
           content = ''; images = {}; ly = PH - margin;
         }
-        content += textOp(margin, ly, 12, ln);
+        content += await textAt(margin, ly, 12, ln, images, false, PW - 2 * margin);
         ly -= 16;
       }
       content += textOp(PW / 2 - 6, margin / 2, 9, String(numberOf(s)));
@@ -276,25 +336,27 @@ export async function deckToPdf(deck: Deck, opts: PdfOptions = {}): Promise<Uint
     }
   } else {
     let content = '';
+    let images: Record<string, number> = {};
     let y = PH - margin;
-    const flush = () => { if (content) pdf.page(PW, PH, content); content = ''; y = PH - margin; };
-    const line = (s: string, size: number, indent: number, bold = false) => {
+    const flush = () => { if (content) pdf.page(PW, PH, content, images); content = ''; images = {}; y = PH - margin; };
+    const line = async (s: string, size: number, indent: number, bold = false) => {
       for (const ln of wrapText(s, size, PW - 2 * margin - indent, bold)) {
         if (y < margin + size) flush();
-        content += textOp(margin + indent, y - size, size, ln, bold);
+        content += await textAt(margin + indent, y - size, size, ln, images, bold, PW - 2 * margin - indent);
         y -= size * 1.35;
       }
     };
-    if (deck.data.props.title) { line(deck.data.props.title, 20, 0, true); y -= 8; }
+    if (deck.data.props.title) { await line(deck.data.props.title, 20, 0, true); y -= 8; }
     for (const s of slides) {
       const o = slideOutline(s);
-      line(`${numberOf(s)}. ${o.title || '(untitled slide)'}`, 14, 0, true);
-      for (const b of o.body) line(`• ${b.text}`, 11, 18 + b.level * 18);
+      await line(`${numberOf(s)}. ${o.title || '(untitled slide)'}`, 14, 0, true);
+      for (const b of o.body) await line(`• ${b.text}`, 11, 18 + b.level * 18);
       y -= 8;
     }
     flush();
     if (!pdf.pageCount) pdf.page(PW, PH, '');
   }
+  if (!pdf.pageCount) throw new Error('No slides to export.');
   const p = deck.data.props;
   const info: Record<string, string> = { Producer: '(Anne\'s Stage)', Creator: '(Anne\'s Stage)', CreationDate: pdfDate(Date.now()) };
   if (p.title) info.Title = infoString(p.title);

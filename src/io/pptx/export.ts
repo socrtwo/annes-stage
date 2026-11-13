@@ -57,6 +57,9 @@ class Writer {
   overrides = new Map<string, string>();
   defaults = new Map<string, string>([['rels', CT.rels], ['xml', 'application/xml']]);
   mediaParts = new Map<string, string>();
+  /** PNG renderings of SVG/WebP pictures, used as the main blip (PowerPoint before 2016 cannot show either). */
+  rasters = new Map<string, Uint8Array>();
+  svgParts = new Map<string, string>();
   charts = 0;
   constructor(public deck: Deck) {}
 
@@ -70,11 +73,31 @@ class Writer {
     if (this.mediaParts.has(id)) return this.mediaParts.get(id)!;
     const m = this.deck.media[id];
     if (!m) return null;
+    const raster = this.rasters.get(id);
+    if (raster) {
+      const part = `ppt/media/media${this.mediaParts.size + 1}.png`;
+      this.files.set(part, raster);
+      if (!this.defaults.has('png')) this.defaults.set('png', 'image/png');
+      this.mediaParts.set(id, part);
+      return part;
+    }
     const ext = MIME_EXT[m.mime] || (m.mime.split('/')[1] || 'bin').replace(/[^a-z0-9]/gi, '').slice(0, 5) || 'bin';
     const part = `ppt/media/media${this.mediaParts.size + 1}.${ext}`;
     this.files.set(part, unb64(m.b64));
     if (!this.defaults.has(ext)) this.defaults.set(ext, m.mime === 'image/x-emf' ? 'image/x-emf' : m.mime === 'image/x-wmf' ? 'image/x-wmf' : m.mime);
     this.mediaParts.set(id, part);
+    return part;
+  }
+
+  /** The original SVG of a rasterised picture, for the svgBlip extension; null otherwise. */
+  svgPart(id: string): string | null {
+    const m = this.deck.media[id];
+    if (!m || m.mime !== 'image/svg+xml' || !this.rasters.has(id)) return null;
+    if (this.svgParts.has(id)) return this.svgParts.get(id)!;
+    const part = `ppt/media/image-svg${this.svgParts.size + 1}.svg`;
+    this.files.set(part, unb64(m.b64));
+    if (!this.defaults.has('svg')) this.defaults.set('svg', 'image/svg+xml');
+    this.svgParts.set(id, part);
     return part;
   }
 
@@ -371,7 +394,9 @@ function pictureXml(e: PictureElement, ctx: PartCtx): string {
   const src = c && c.some((v) => v) ? `<a:srcRect l="${Math.round(c[0] * 100000)}" t="${Math.round(c[1] * 100000)}" r="${Math.round(c[2] * 100000)}" b="${Math.round(c[3] * 100000)}"/>` : '';
   const adj = e.adjust;
   const blipKids = adj?.grayscale ? '<a:grayscl/>' : adj?.transparency ? `<a:alphaModFix amt="${Math.round((1 - adj.transparency) * 100000)}"/>` : '';
-  const blip = blipKids ? `<a:blip r:embed="${rid}">${blipKids}</a:blip>` : `<a:blip r:embed="${rid}"/>`;
+  const svg = e.media ? ctx.w.svgPart(e.media) : null;
+  const svgExt = svg ? `<a:extLst><a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}"><asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" r:embed="${ctx.addRel(REL.image, svg)}"/></a:ext></a:extLst>` : '';
+  const blip = blipKids || svgExt ? `<a:blip r:embed="${rid}">${blipKids}${svgExt}</a:blip>` : `<a:blip r:embed="${rid}"/>`;
   return `<p:pic><p:nvPicPr>${cNvPr(e, ctx, 'Picture')}<p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr>${phXml(e)}</p:nvPicPr><p:blipFill>${blip}${src}<a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr>${xfrmXml(e)}${geomXml(e.geom || 'rect', undefined, undefined)}${lineXml(e.line, ctx)}${effectsXml(e.effects)}</p:spPr></p:pic>`;
 }
 
@@ -392,7 +417,7 @@ function groupXml(g: GroupElement, ctx: PartCtx): string {
   // Children are stored in slide coordinates: child offset/extent = the group's own box.
   const box = groupBox(g);
   const off = `<a:off x="${toEmu(box.x)}" y="${toEmu(box.y)}"/><a:ext cx="${toEmu(box.w)}" cy="${toEmu(box.h)}"/>`;
-  const x = `<a:xfrm${g.rot ? ` rot="${Math.round(g.rot * 60000)}"` : ''}>${off}<a:chOff x="${toEmu(box.x)}" y="${toEmu(box.y)}"/><a:chExt cx="${toEmu(box.w)}" cy="${toEmu(box.h)}"/></a:xfrm>`;
+  const x = `<a:xfrm${g.rot ? ` rot="${Math.round(g.rot * 60000)}"` : ''}${g.flipH ? ' flipH="1"' : ''}${g.flipV ? ' flipV="1"' : ''}>${off}<a:chOff x="${toEmu(box.x)}" y="${toEmu(box.y)}"/><a:chExt cx="${toEmu(box.w)}" cy="${toEmu(box.h)}"/></a:xfrm>`;
   const nv = `<p:nvGrpSpPr>${cNvPr(g, ctx, 'Group')}<p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>`;
   return `<p:grpSp>${nv}<p:grpSpPr>${x}</p:grpSpPr>${g.children.map((c) => elementXml(c, ctx)).join('')}</p:grpSp>`;
 }
@@ -524,7 +549,10 @@ const TRANS_OUT: Record<string, (t: Transition) => string> = {
   fade: (t) => `<p:fade${t.thruBlk ? ' thruBlk="1"' : ''}/>`,
   push: (t) => `<p:push dir="${dir4(t.dir, 'u')}"/>`,
   wipe: (t) => `<p:wipe dir="${dir4(t.dir, 'r')}"/>`,
-  split: (t) => `<p:split orient="${t.dir === 'vert' ? 'vert' : 'horz'}" dir="${t.dir === 'in' ? 'in' : 'out'}"/>`,
+  split: (t) => {
+    const io = t.inOut || (t.dir === 'in' ? 'in' : 'out');
+    return `<p:split orient="${t.dir === 'vert' ? 'vert' : 'horz'}" dir="${io}"/>`;
+  },
   reveal: (t) => `<p:pull dir="${dir8(t.dir, 'l')}"/>`,
   cover: (t) => `<p:cover dir="${dir8(t.dir, 'l')}"/>`,
   uncover: (t) => `<p:pull dir="${dir8(t.dir, 'l')}"/>`,
@@ -550,6 +578,11 @@ function transitionXml(t: Transition | undefined): string {
   if (t.type === 'none') return `<p:transition${a}/>`;
   if (t.type === 'morph') {
     return `<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice xmlns:p159="http://schemas.microsoft.com/office/powerpoint/2015/09/main" Requires="p159"><p:transition${a}><p159:morph option="byObject"/></p:transition></mc:Choice><mc:Fallback><p:transition${a}><p:fade/></p:transition></mc:Fallback></mc:AlternateContent>`;
+  }
+  if (t.type === 'reveal') {
+    // Reveal is a PowerPoint 2010 transition: p14:reveal, with a pull for older readers.
+    const d = t.dir === 'r' ? 'r' : 'l';
+    return `<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main" Requires="p14"><p:transition${a}><p14:reveal${t.thruBlk ? ' thruBlk="1"' : ''} dir="${d}"/></p:transition></mc:Choice><mc:Fallback><p:transition${a}><p:pull dir="${d}"/></p:transition></mc:Fallback></mc:AlternateContent>`;
   }
   const fn = TRANS_OUT[t.type] || TRANS_OUT.fade;
   return `<p:transition${a}>${fn(t)}</p:transition>`;
@@ -647,7 +680,7 @@ function themeXml(t: Theme, name = t.name): string {
   const clr = (['dk1', 'lt1', 'dk2', 'lt2', 'accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6', 'hlink', 'folHlink'] as const)
     .map((k) => `<a:${k}><a:srgbClr val="${(t.colors[k] || '#000000').replace('#', '').toUpperCase()}"/></a:${k}>`).join('');
   const font = (f: string) => `<a:latin typeface="${esc(f)}"/><a:ea typeface=""/><a:cs typeface=""/>`;
-  const fmt = t.keep?.fmtScheme && /^<a:fmtScheme/.test(t.keep.fmtScheme) ? t.keep.fmtScheme : DEFAULT_FMT;
+  const fmt = t.keep?.fmtScheme && /^<a:fmtScheme/.test(t.keep.fmtScheme) && !/:(embed|link|id)="/.test(t.keep.fmtScheme) ? t.keep.fmtScheme : DEFAULT_FMT;
   return `${XML_DECL}<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="${esc(name)}"><a:themeElements><a:clrScheme name="${esc(name)}">${clr}</a:clrScheme><a:fontScheme name="${esc(name)}"><a:majorFont>${font(t.fonts.major)}</a:majorFont><a:minorFont>${font(t.fonts.minor)}</a:minorFont></a:fontScheme>${fmt}</a:themeElements><a:objectDefaults/><a:extraClrSchemeLst/></a:theme>`;
 }
 
@@ -667,9 +700,48 @@ const LAYOUT_TYPES = new Set(['title', 'tx', 'twoColTx', 'tbl', 'txAndChart', 'c
 
 // ------------------------------------------------------------------------------------------
 
+/**
+ * SVG and WebP pictures are not shown by every PowerPoint version: when a browser canvas is at
+ * hand, picture media of those types get a PNG rendering (SVG keeps its original through the
+ * svgBlip extension). Without a canvas (tests, workers) the media is written as it is.
+ */
+async function rasterizePictures(w: Writer): Promise<void> {
+  if (typeof document === 'undefined' || typeof Image === 'undefined') return;
+  const ids = new Set<string>();
+  const any = Object.values(w.deck.media).some((m) => m.mime === 'image/svg+xml' || m.mime === 'image/webp');
+  if (!any) return;
+  try { if (!document.createElement('canvas').getContext('2d')) return; } catch { return; }
+  const visit = (els: Element[]) => { for (const e of els) { if (e.kind === 'picture' && e.media) ids.add(e.media); if (e.kind === 'group') visit(e.children); } };
+  for (const o of [...w.deck.data.masters, ...w.deck.data.layouts, ...w.deck.data.slides]) visit(o.elements);
+  for (const id of ids) {
+    const m = w.deck.media[id];
+    if (!m || (m.mime !== 'image/svg+xml' && m.mime !== 'image/webp')) continue;
+    try {
+      const png = await toPng(`data:${m.mime};base64,${m.b64}`);
+      if (png) w.rasters.set(id, png);
+    } catch { /* keep the original */ }
+  }
+}
+
+async function toPng(url: string): Promise<Uint8Array | null> {
+  const img = new Image();
+  const ok = await new Promise<boolean>((res) => { img.onload = () => res(true); img.onerror = () => res(false); img.src = url; setTimeout(() => res(false), 5000); });
+  if (!ok) return null;
+  const nw = img.naturalWidth || 1024, nh = img.naturalHeight || 768;
+  const k = Math.min(1, 4096 / Math.max(nw, nh));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(nw * k)); canvas.height = Math.max(1, Math.round(nh * k));
+  const g = canvas.getContext('2d');
+  if (!g) return null;
+  g.drawImage(img, 0, 0, canvas.width, canvas.height);
+  const blob = await new Promise<Blob | null>((res) => { try { canvas.toBlob((b) => res(b), 'image/png'); } catch { res(null); } });
+  return blob ? new Uint8Array(await blob.arrayBuffer()) : null;
+}
+
 export async function exportPptx(deck: Deck, variant: PptxVariant = 'pptx'): Promise<Uint8Array> {
   const w = new Writer(deck);
   const data = deck.data;
+  await rasterizePictures(w);
   const pres = new PartCtx('ppt/presentation.xml', w);
   let uid = 2147483648;
 

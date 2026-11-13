@@ -10,7 +10,8 @@ import type { Color, Element as SEl, Fill, GroupElement, Layout, LevelStyle, Lin
 import { resolveColor, type ColorContext } from '../model/theme';
 import { geometryPath, GEOMETRY } from '../model/geometry';
 import { renderChart } from '../render/chart';
-import { attr, b64, dec, decodeXml, desc, enc, esc, kid, kids, parseXml, sniffMediaMime, unb64, MIME_EXT } from './xml';
+import { attr, b64, dec, decodeXml, desc, enc, esc, imageSizePt, kid, kids, parseXml, sniffMediaMime, unb64, MIME_EXT } from './xml';
+import { readZipCapped } from './zip';
 
 export const ODP_MIME = 'application/vnd.oasis.opendocument.presentation';
 export const OTP_MIME = 'application/vnd.oasis.opendocument.presentation-template';
@@ -31,6 +32,26 @@ export function len(v: string | null | undefined): number | undefined {
   }
 }
 const pt = (n: number | undefined) => `${+(n ?? 0).toFixed(3)}pt`;
+
+/** Parses an ODF angle to degrees: unitless values are tenths of a degree (as LibreOffice writes them); deg, grad and rad suffixes are honoured. */
+export function odfAngle(v: string | null | undefined): number {
+  const m = /^\s*(-?[\d.]+(?:e[-+]?\d+)?)\s*(deg|grad|rad)?\s*$/i.exec(v || '');
+  if (!m) return 0;
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n)) return 0;
+  switch ((m[2] || '').toLowerCase()) {
+    case 'deg': return n;
+    case 'grad': return n * 0.9;
+    case 'rad': return (n * 180) / Math.PI;
+    default: return n / 10;
+  }
+}
+
+/** Exact SMIL subtype → model direction (barWipe directions also depend on smil:direction). */
+const SUB_DIR: Record<string, Transition['dir']> = {
+  fromLeft: 'l', fromRight: 'r', fromTop: 'u', fromBottom: 'd', fromTopLeft: 'lu', fromTopRight: 'ru', fromBottomLeft: 'ld', fromBottomRight: 'rd',
+  horizontal: 'horz', vertical: 'vert', leftToRight: 'r', topToBottom: 'd',
+};
 
 // ------------------------------------------------------------------------------------------
 // Import
@@ -122,8 +143,8 @@ class OdpImporter {
     if (f === 'gradient') {
       const g = desc(this.stylesDoc || this.content, 'gradient').find((e) => attr(e, 'name') === p['fill-gradient-name']);
       const a = this.color(attr(g, 'start-color') || undefined) || '#FFFFFF', b = this.color(attr(g, 'end-color') || undefined) || '#000000';
-      const ang = parseFloat(attr(g, 'angle') || '0');
-      return { type: 'gradient', stops: [{ pos: 0, color: a }, { pos: 1, color: b }], angle: (90 - (ang > 360 ? ang / 10 : ang) + 360) % 360, ...(attr(g, 'style') === 'radial' ? { path: 'radial' as const } : {}) };
+      const ang = odfAngle(attr(g, 'angle'));
+      return { type: 'gradient', stops: [{ pos: 0, color: a }, { pos: 1, color: b }], angle: +((((90 - ang) % 360) + 360) % 360).toFixed(3), ...(attr(g, 'style') === 'radial' ? { path: 'radial' as const } : {}) };
     }
     if (f === 'bitmap') {
       const img = desc(this.stylesDoc || this.content, 'fill-image').find((e) => attr(e, 'name') === p['fill-image-name']);
@@ -281,8 +302,14 @@ class OdpImporter {
     const sd = tf ? attr(tf, 'dur') : null;
     t.dur = sd ? parseFloat(sd) * (sd.endsWith('ms') ? 1 : 1000) : speed === 'slow' ? 1000 : speed === 'fast' ? 500 : 750;
     if (type === 'fade' && sub === 'fadeOverColor') t.thruBlk = true;
-    if (sub) { const s = sub.toLowerCase(); t.dir = s.includes('left') ? 'l' : s.includes('right') ? 'r' : s.includes('top') ? 'u' : s.includes('bottom') ? 'd' : s.includes('vertical') ? 'vert' : s.includes('horizontal') ? 'horz' : undefined; if (!t.dir) delete t.dir; }
-    if (t.type === 'cover' && dir === 'reverse') t.type = 'uncover';
+    const reverse = dir === 'reverse';
+    if (sub && SUB_DIR[sub]) {
+      t.dir = SUB_DIR[sub];
+      // A reversed bar wipe runs right-to-left / bottom-to-top.
+      if (type === 'barWipe' && reverse) t.dir = t.dir === 'r' ? 'l' : t.dir === 'd' ? 'u' : t.dir;
+    }
+    if (t.type === 'split' && reverse) t.inOut = 'in';
+    if (t.type === 'cover' && reverse) t.type = 'uncover';
     if (advAfter != null) t.advAfter = advAfter;
     return t;
   }
@@ -345,8 +372,16 @@ class OdpImporter {
         this.box(e, pic);
         const clip = gp['clip'];
         if (clip && pic.w && pic.h) {
-          const v = /rect\(([^)]*)\)/.exec(clip)?.[1].split(/[ ,]+/).map(len);
-          if (v && v.length === 4) { const [t, r, b, l] = v as number[]; const W = pic.w + (l || 0) + (r || 0), H = pic.h + (t || 0) + (b || 0); if (W > 0 && H > 0) pic.crop = [(l || 0) / W, (t || 0) / H, (r || 0) / W, (b || 0) / H]; }
+          const v = /rect\(([^)]*)\)/.exec(clip)?.[1].trim().split(/\s*,\s*|\s+/).map((x) => (x === 'auto' ? 0 : len(x)));
+          if (v && v.length === 4) {
+            const [t, r, b, l] = (v as (number | undefined)[]).map((x) => x || 0);
+            // fo:clip offsets are measured against the picture's intrinsic size, not the frame.
+            const bytes = this.files.get(href.replace(/^\.\//, ''));
+            const nat = bytes ? imageSizePt(bytes) : null;
+            const W = nat ? nat.w : pic.w + l + r, H = nat ? nat.h : pic.h + t + b;
+            const c = [l / W, t / H, r / W, b / H].map((x) => Math.max(0, Math.min(0.999, x)));
+            if (W > 0 && H > 0 && c.some((x) => x > 0)) pic.crop = c as [number, number, number, number];
+          }
         }
         if (cls === 'graphic' || cls === 'object') pic.ph = undefined;
         return common(pic);
@@ -559,10 +594,17 @@ function absolutize(d: string): string {
 export async function importOdp(data: Uint8Array): Promise<{ deck: Deck; warnings: string[] }> {
   const head = dec(data.subarray(0, 512));
   if (/^\s*<|^﻿/.test(head)) return importFodp(data);
-  const zip = await JSZip.loadAsync(data);
-  const files = new Map<string, Uint8Array>();
-  for (const f of Object.values(zip.files)) if (!f.dir) files.set(f.name, await f.async('uint8array'));
-  return importOdpParts(files);
+  // Parts are inflated with size caps; binaries only when content or styles refer to them.
+  const files = await readZipCapped(data, {
+    phase2: (parts) => {
+      let xml = '';
+      for (const [k, v] of parts) if (/\.xml$/i.test(k) && !/manifest\.xml$/i.test(k)) xml += decodeXml(v);
+      return (name) => { const base = name.split('/').pop() || name; return xml.includes(name) || xml.includes(encodeURI(name)) || xml.includes(base); };
+    },
+  });
+  const r = importOdpParts(files.files);
+  r.warnings.push(...files.warnings);
+  return r;
 }
 
 export function importOdpParts(files: Map<string, Uint8Array>): { deck: Deck; warnings: string[] } {
@@ -607,10 +649,24 @@ const TRANS_TO_SMIL: Record<string, [string, string]> = {
 };
 const DIR_SUB: Record<string, Record<string, string>> = {
   pushWipe: { l: 'fromLeft', r: 'fromRight', u: 'fromTop', d: 'fromBottom' },
-  slideWipe: { l: 'fromLeft', r: 'fromRight', u: 'fromTop', d: 'fromBottom' },
+  slideWipe: { l: 'fromLeft', r: 'fromRight', u: 'fromTop', d: 'fromBottom', lu: 'fromTopLeft', ru: 'fromTopRight', ld: 'fromBottomLeft', rd: 'fromBottomRight' },
   barWipe: { l: 'leftToRight', r: 'leftToRight', u: 'topToBottom', d: 'topToBottom' },
   barnDoorWipe: { horz: 'horizontal', vert: 'vertical' },
 };
+
+/** A split transition also records whether it opens out (default) or closes in. */
+export type SplitTransition = Transition;
+
+/** SMIL type, subtype and reverse flag of a transition. */
+function smilOf(t: Transition): { type: string; sub: string; reverse: boolean } {
+  const [type, sub0] = TRANS_TO_SMIL[t.type] || TRANS_TO_SMIL.fade;
+  const sub = (t.dir && DIR_SUB[type]?.[t.dir]) || (t.thruBlk && type === 'fade' ? 'fadeOverColor' : sub0);
+  let reverse = t.type === 'uncover' || t.type === 'reveal' || t.type === 'pull';
+  // Bar wipes run left-to-right / top-to-bottom; the opposite directions are reversed.
+  if (type === 'barWipe' && (t.dir === 'l' || t.dir === 'u')) reverse = true;
+  if (type === 'barnDoorWipe' && t.inOut === 'in') reverse = true;
+  return { type, sub, reverse };
+}
 
 class OdpWriter {
   auto: string[] = [];
@@ -620,6 +676,7 @@ class OdpWriter {
   manifest: [string, string][] = [];
   mediaPaths = new Map<string, string>();
   fonts = new Set<string>();
+  warnings: string[] = [];
   constructor(public deck: Deck, public flat: boolean) {}
 
   /** Returns an automatic style name for these properties, reusing identical ones. */
@@ -645,6 +702,8 @@ class OdpWriter {
     if (this.mediaPaths.has(id)) return this.mediaPaths.get(id)!;
     const m = this.deck.media[id];
     if (!m) return null;
+    // Flat files embed pictures inline (office:binary-data); nothing goes into a package.
+    if (this.flat) { const p = `Pictures/${id}`; this.mediaPaths.set(id, p); return p; }
     const ext = MIME_EXT[m.mime] || 'bin';
     const dir = /^image\//.test(m.mime) ? 'Pictures' : 'Media';
     const p = `${dir}/${id}.${ext}`;
@@ -832,7 +891,11 @@ class OdpWriter {
         let gp = '<style:graphic-properties draw:fill="none" draw:stroke="none"/>';
         if (e.crop && e.crop.some((v) => v) && e.w && e.h) {
           const [l, t, r, b] = e.crop; const vw = 1 - l - r, vh = 1 - t - b;
-          const W = e.w / (vw || 1), H = e.h / (vh || 1);
+          // fo:clip is measured against the picture's intrinsic size (96 dpi when it records none).
+          const m = this.deck.media[e.media];
+          let nat: { w: number; h: number } | null = null;
+          try { nat = m && /^image\//.test(m.mime) ? imageSizePt(unb64(m.b64.slice(0, 200000))) : null; } catch { nat = null; }
+          const W = nat ? nat.w : e.w / (vw || 1), H = nat ? nat.h : e.h / (vh || 1);
           gp = `<style:graphic-properties draw:fill="none" draw:stroke="none" fo:clip="rect(${pt(t * H)}, ${pt(r * W)}, ${pt(b * H)}, ${pt(l * W)})"/>`;
         }
         const gs = this.style('graphic', 'gr', gp);
@@ -841,6 +904,12 @@ class OdpWriter {
         return `<draw:frame draw:style-name="${gs}" draw:layer="${layer}"${nm} ${this.boxAttrs(e, fb)}>${img}${td}</draw:frame>`;
       }
       case 'media': {
+        if (this.flat) {
+          // A flat file cannot carry audio or video (draw:plugin has no inline data): keep the poster frame.
+          this.warnings.push(`A ${e.mediaKind === 'audio' ? 'sound' : 'video'} was left out: flat OpenDocument files cannot embed media${e.poster ? ' (its poster picture was kept)' : ''}.`);
+          if (!e.poster || !this.deck.media[e.poster]) return '';
+          return this.element({ id: e.id, kind: 'picture', media: e.poster, x: e.x, y: e.y, w: e.w, h: e.h, name: e.name, alt: e.alt } as PictureElement, owner, layer);
+        }
         const p = this.media(e.media);
         if (!p) return '';
         const gs = this.style('graphic', 'gr', '<style:graphic-properties draw:fill="none" draw:stroke="none"/>');
@@ -901,9 +970,8 @@ class OdpWriter {
     if (s.hidden) a += ' presentation:visibility="hidden"';
     const t = s.transition;
     if (t && t.type !== 'none' && t.type !== 'cut') {
-      const [type, sub0] = TRANS_TO_SMIL[t.type] || TRANS_TO_SMIL.fade;
-      const sub = (t.dir && DIR_SUB[type]?.[t.dir]) || (t.thruBlk && type === 'fade' ? 'fadeOverColor' : sub0);
-      a += ` smil:type="${type}" smil:subtype="${sub}"${t.type === 'uncover' || t.type === 'reveal' || t.type === 'pull' ? ' smil:direction="reverse"' : ''} presentation:transition-speed="${(t.dur ?? 700) >= 1000 ? 'slow' : (t.dur ?? 700) >= 600 ? 'medium' : 'fast'}"`;
+      const { type, sub, reverse } = smilOf(t);
+      a += ` smil:type="${type}" smil:subtype="${sub}"${reverse ? ' smil:direction="reverse"' : ''} presentation:transition-speed="${(t.dur ?? 700) >= 1000 ? 'slow' : (t.dur ?? 700) >= 600 ? 'medium' : 'fast'}"`;
     }
     if (t?.advAfter != null) a += ` presentation:transition-type="automatic" presentation:duration="PT${(t.advAfter / 1000).toFixed(3).replace(/\.?0+$/, '')}S"`;
     return this.style('drawing-page', 'dp', `<style:drawing-page-properties presentation:background-visible="true" presentation:background-objects-visible="${s.hideMasterShapes ? 'false' : 'true'}" presentation:display-footer="true" presentation:display-page-number="false" presentation:display-date-time="false"${a}/>`);
@@ -912,13 +980,12 @@ class OdpWriter {
   transitionAnim(s: Slide): string {
     const t = s.transition;
     if (!t || t.type === 'none' || t.type === 'cut') return '';
-    const [type, sub0] = TRANS_TO_SMIL[t.type] || TRANS_TO_SMIL.fade;
-    const sub = (t.dir && DIR_SUB[type]?.[t.dir]) || (t.thruBlk && type === 'fade' ? 'fadeOverColor' : sub0);
-    return `<anim:par presentation:node-type="timing-root"><anim:transitionFilter smil:dur="${((t.dur ?? 700) / 1000).toFixed(3)}s" smil:type="${type}" smil:subtype="${sub}"${t.type === 'uncover' || t.type === 'reveal' || t.type === 'pull' ? ' smil:direction="reverse"' : ''}/></anim:par>`;
+    const { type, sub, reverse } = smilOf(t);
+    return `<anim:par presentation:node-type="timing-root"><anim:transitionFilter smil:dur="${((t.dur ?? 700) / 1000).toFixed(3)}s" smil:type="${type}" smil:subtype="${sub}"${reverse ? ' smil:direction="reverse"' : ''}/></anim:par>`;
   }
 }
 
-export async function exportOdp(deck: Deck, opts: { flat?: boolean; template?: boolean } = {}): Promise<Uint8Array> {
+export async function exportOdp(deck: Deck, opts: { flat?: boolean; template?: boolean; /** Receives notes about content that could not be written. */ warnings?: string[] } = {}): Promise<Uint8Array> {
   const w = new OdpWriter(deck, !!opts.flat);
   const data = deck.data;
   const page = `<style:page-layout style:name="PM1"><style:page-layout-properties fo:margin-top="0pt" fo:margin-bottom="0pt" fo:margin-left="0pt" fo:margin-right="0pt" fo:page-width="${pt(data.size.w)}" fo:page-height="${pt(data.size.h)}" style:print-orientation="${data.size.w >= data.size.h ? 'landscape' : 'portrait'}"/></style:page-layout>`;
@@ -950,9 +1017,10 @@ export async function exportOdp(deck: Deck, opts: { flat?: boolean; template?: b
     masterStyles.push(`<style:master-page style:name="${name}" style:page-layout-name="PM1" draw:style-name="Mdp${i + 1}">${els}<presentation:notes style:page-layout-name="PM1"/></style:master-page>`);
   });
   // Master graphics may have created automatic styles in w.auto: those belong to styles.xml.
+  // In a flat file both sets share one office:automatic-styles, so names must stay unique: keep the
+  // counters (and allow reuse of identical styles) instead of starting over.
   const stylesAuto = w.auto.splice(0);
-  w.autoKeys.clear();
-  w.counters = {};
+  if (!opts.flat) { w.autoKeys.clear(); w.counters = {}; }
   // Slides
   const pages = data.slides.map((s, i) => {
     const ps = w.pageStyle(s);
@@ -975,6 +1043,7 @@ export async function exportOdp(deck: Deck, opts: { flat?: boolean; template?: b
   const now = new Date().toISOString().replace(/\.\d+Z$/, '');
   const metaInner = `<meta:generator>Anne\'s Stage</meta:generator>${p.title ? `<dc:title>${esc(p.title)}</dc:title>` : ''}${p.subject ? `<dc:subject>${esc(p.subject)}</dc:subject>` : ''}${p.author ? `<meta:initial-creator>${esc(p.author)}</meta:initial-creator><dc:creator>${esc(p.author)}</dc:creator>` : ''}${p.description ? `<dc:description>${esc(p.description)}</dc:description>` : ''}${(p.keywords || '').split(/\s*,\s*/).filter(Boolean).map((k) => `<meta:keyword>${esc(k)}</meta:keyword>`).join('')}<meta:creation-date>${p.created ? new Date(p.created).toISOString().replace(/\.\d+Z$/, '') : now}</meta:creation-date><dc:date>${now}</dc:date>`;
   const mime = opts.template ? OTP_MIME : ODP_MIME;
+  if (opts.warnings) opts.warnings.push(...w.warnings.filter((x, i, a) => a.indexOf(x) === i));
   if (opts.flat) {
     const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<office:document ${NS} office:version="1.3" office:mimetype="application/vnd.oasis.opendocument.presentation"><office:meta>${metaInner}</office:meta>${fontDecls}${officeStyles}<office:automatic-styles>${page}${masterAuto.join('')}${stylesAuto.join('')}${w.auto.join('')}</office:automatic-styles>${masterXml}${body}</office:document>`;
     return enc(xml);
