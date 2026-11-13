@@ -89,6 +89,20 @@ export interface DialogOptions {
   help?: string;
 }
 
+const shown = (x: HTMLElement, box: HTMLElement) => { for (let n: HTMLElement | null = x; n && n !== box; n = n.parentElement) if (n.hidden || n.style.display === 'none') return false; return true; };
+
+/** Keeps Tab and Shift+Tab inside a modal dialog (aria-modal), wrapping at either end. */
+export function trapTab(box: HTMLElement, e: KeyboardEvent): void {
+  const items = [...box.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]')]
+    .filter((x) => x.tabIndex >= 0 && !(x as HTMLButtonElement).disabled && shown(x, box));
+  if (!items.length) { e.preventDefault(); return; }
+  const first = items[0], last = items[items.length - 1];
+  const a = document.activeElement as HTMLElement | null;
+  if (!a || !box.contains(a)) { e.preventDefault(); (e.shiftKey ? last : first).focus(); return; }
+  if (e.shiftKey && a === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && a === last) { e.preventDefault(); first.focus(); }
+}
+
 let dialogDepth = 0;
 /** Open dialogs, innermost last: only the top one handles Escape and Enter. */
 const dialogStack: HTMLElement[] = [];
@@ -167,6 +181,7 @@ export function openDialog(opts: DialogOptions): Promise<Record<string, any> | n
       const plainEsc = e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey;
       if ((e.target as HTMLElement | null)?.closest?.('[data-capture-keys]') && !plainEsc) return;
       if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); finish(null); }
+      if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) { trapTab(box, e); return; }
       if (e.key === 'Enter' && !(e.target instanceof HTMLTextAreaElement) && !(e.target instanceof HTMLButtonElement) && opts.ok !== false) {
         e.preventDefault(); e.stopImmediatePropagation(); okClick();
       }

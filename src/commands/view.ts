@@ -77,7 +77,8 @@ def([
     },
   },
   { id: 'view.fit', label: 'Fit to Window', icon: 'fit_screen', tab: 'View', group: 'Zoom', noRecord: true, run: (app) => app.tab.ui.setZoom('fit') },
-  { id: 'view.zoomIn', label: 'Zoom In', icon: 'zoom_in', tab: 'View', group: 'Zoom', keys: ['Mod-='], noRecord: true, run: (app) => app.tab.ui.setZoom(Math.min(4, app.tab.ui.zoom * 1.25)) },
+  // Ctrl+= is Subscript, as in Office; Ctrl+Alt+= zooms in.
+  { id: 'view.zoomIn', label: 'Zoom In', icon: 'zoom_in', tab: 'View', group: 'Zoom', keys: ['Mod-Alt-='], noRecord: true, run: (app) => app.tab.ui.setZoom(Math.min(4, app.tab.ui.zoom * 1.25)) },
   { id: 'view.zoomOut', label: 'Zoom Out', icon: 'zoom_out', tab: 'View', group: 'Zoom', keys: ['Mod--'], noRecord: true, run: (app) => app.tab.ui.setZoom(Math.max(0.1, app.tab.ui.zoom / 1.25)) },
   { id: 'view.color', label: 'Color', icon: 'palette', tab: 'View', group: 'Color/Grayscale', kind: 'toggle', noRecord: true, isActive: (app) => !(app.tab as any)?.colorMode, run: (app) => setColorMode(app, 'color') },
   { id: 'view.grayscale', label: 'Grayscale', icon: 'filter_b_and_w', tab: 'View', group: 'Color/Grayscale', kind: 'toggle', noRecord: true, tip: 'Preview the slides as they print in grayscale', isActive: (app) => (app.tab as any)?.colorMode === 'grayscale', run: (app) => setColorMode(app, 'grayscale') },
@@ -91,10 +92,14 @@ def([
     id: 'view.fullScreen', label: 'Full Screen', icon: 'fullscreen', tab: 'View', group: 'Window', kind: 'toggle', noRecord: true,
     tip: 'Hide the ribbon and use the whole screen for editing (Esc returns)',
     isActive: () => document.body.classList.contains('ql-fullscreen'),
-    run: () => {
+    run: (app) => {
+      watchFullScreen(app);
       const on = !document.body.classList.contains('ql-fullscreen');
       document.body.classList.toggle('ql-fullscreen', on);
-      try { if (on) void document.documentElement.requestFullscreen?.(); else if (document.fullscreenElement) void document.exitFullscreen(); } catch { /* not allowed */ }
+      try {
+        if (on) document.documentElement.requestFullscreen?.()?.catch?.(() => { /* not allowed: the ribbon stays hidden until Esc */ });
+        else if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+      } catch { /* not allowed */ }
     },
   },
   {
@@ -102,14 +107,23 @@ def([
     tip: 'A second view of this presentation in the same window (as a tab) — edits show in both',
     run: (app) => {
       const t = app.tab;
+      // The tabs share the deck; App.createTab makes every tab on it refresh when it changes.
       const twin = app.createTab(t.deck, { title: t.title, fileName: t.fileName, format: t.format, uri: t.uri, key: t.key });
-      // Both tabs share the deck; refresh both when it changes.
-      t.deck.onChange = () => { app.deckChanged(t); app.deckChanged(twin); };
-      twin.title = `${t.title}:2`;
+      twin.title = `${t.title}:${app.docs.filter((d) => d.deck === t.deck).length}`;
       app.ui.tabsChanged();
     },
   },
 ]);
+
+/** Leaves Full Screen when the browser leaves full screen (its own Esc) or on Esc when it never entered it. */
+let fullScreenWatched = false;
+function watchFullScreen(app: App): void {
+  if (fullScreenWatched) return;
+  fullScreenWatched = true;
+  const leave = () => { if (!document.body.classList.contains('ql-fullscreen')) return; document.body.classList.remove('ql-fullscreen'); app.refresh(); };
+  document.addEventListener('fullscreenchange', () => { if (!document.fullscreenElement) leave(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !document.fullscreenElement) leave(); });
+}
 
 // Quick Access Bar and ribbon -----------------------------------------------------------------
 

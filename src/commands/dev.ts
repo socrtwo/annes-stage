@@ -5,16 +5,38 @@ import type { Macro } from '../prefs';
 import { Deck } from '../model/deck';
 import { getCommand } from './registry';
 import { openDialog, toast, confirmDialog, promptDialog } from '../ui/dialog';
-import { download, pickFile } from '../ui/dom';
+import { download, pickFile, esc } from '../ui/dom';
 
-async function runMacro(app: App, name: string): Promise<void> {
+/** Macros running inside one another, outermost first. */
+const runningMacros: string[] = [];
+let macroAbort = false;
+export const MAX_MACRO_DEPTH = 8;
+
+export async function runMacro(app: App, name: string): Promise<void> {
   const m = app.prefs.macros.find((x) => x.name === name);
   if (!m) { toast(`No macro named "${name}".`); return; }
-  for (const s of m.steps) {
-    if (s.id === 'dev.runMacro' && s.arg === name) continue; // never recurse into itself
-    if (!getCommand(s.id)) { toast(`Macro "${name}" stopped: the command ${s.id} no longer exists.`); return; }
-    const r = app.exec(s.id, s.arg);
-    if (r instanceof Promise) await r;
+  if (runningMacros.includes(name) || runningMacros.length >= MAX_MACRO_DEPTH) {
+    macroAbort = true;
+    toast(runningMacros.includes(name)
+      ? `Macro "${name}" stopped: it runs itself (${[...runningMacros, name].join(' → ')}).`
+      : `Macro "${name}" stopped: macros can run other macros only ${MAX_MACRO_DEPTH} levels deep.`);
+    return;
+  }
+  if (!runningMacros.length) macroAbort = false;
+  runningMacros.push(name);
+  try {
+    for (const s of m.steps) {
+      if (macroAbort) return;
+      if (!getCommand(s.id)) { toast(`Macro "${name}" stopped: the command ${s.id} no longer exists.`); macroAbort = true; return; }
+      // Steps run as part of the macro: they are not recorded again or made the command to repeat.
+      app.execDepth = (app.execDepth || 0) + 1;
+      let r: unknown;
+      try { r = app.exec(s.id, s.arg); } finally { app.execDepth--; }
+      if (r instanceof Promise) await r;
+    }
+  } finally {
+    runningMacros.pop();
+    if (!runningMacros.length) macroAbort = false;
   }
 }
 
@@ -53,7 +75,7 @@ def([
       else if (r.act === 'delete' && (await confirmDialog('Delete Macro', `Delete "${m.name}"?`, 'Delete'))) { app.prefs.macros = ms.filter((x) => x !== m); app.prefs.qat = app.prefs.qat.filter((q) => q !== `macro:${m.name}`); app.savePrefs(); app.ui.renderQat(); }
     },
   },
-  { id: 'dev.runMacro', label: 'Run Macro', icon: 'play_arrow', tab: 'Developer', group: 'Code', internal: true, noRecord: true, edits: false, run: (app, name: string) => runMacro(app, name) },
+  { id: 'dev.runMacro', label: 'Run Macro', icon: 'play_arrow', tab: 'Developer', group: 'Code', internal: true, edits: false, run: (app, name: string) => runMacro(app, name) },
   {
     id: 'dev.recordMacro', label: 'Record Macro', icon: 'fiber_manual_record', tab: 'Developer', group: 'Code', kind: 'toggle', noRecord: true, edits: false,
     tip: 'Record the commands you run (formatting, inserting, slide changes) to replay them later',
@@ -117,7 +139,7 @@ def([
     tip: 'Show the modules in this presentation\'s VBA project (read-only; never run)',
     run: async (app) => {
       const v = vbaSummary(app.deck.data.vba!);
-      await openDialog({ title: 'VBA Project (read-only)', ok: 'Close', cancel: false, fields: [{ key: 'i', type: 'info', html: `<p>${(v.bytes / 1024).toFixed(1)} KB. Anne\'s Stage keeps this project when saving as .pptm and never runs it.</p><p><b>Modules and streams:</b> ${v.names.map((n) => n.replace(/</g, '&lt;')).join(', ') || '(none found)'}</p>` }] });
+      await openDialog({ title: 'VBA Project (read-only)', ok: 'Close', cancel: false, fields: [{ key: 'i', type: 'info', html: `<p>${(v.bytes / 1024).toFixed(1)} KB. Anne\'s Stage keeps this project when saving as .pptm and never runs it.</p><p><b>Modules and streams:</b> ${v.names.map((n) => esc(n)).join(', ') || '(none found)'}</p>` }] });
     },
   },
   {

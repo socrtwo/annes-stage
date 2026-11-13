@@ -47,6 +47,11 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      # Browser smoke test of the built app (tests/e2e/smoke.mjs serves dist/ with vite preview).
+      - name: Install Chromium for the browser test
+        run: npx playwright install --with-deps chromium
+      - name: Browser smoke test
+        run: npm run e2e
       - id: v
         run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
       - name: Package
@@ -157,15 +162,24 @@ jobs:
           ls -la
           sha256sum QuillStage-* > SHA256SUMS.txt
       - id: meta
+        # Inputs reach the script through the environment, never pasted into it, so a tag such as
+        # `v1"; curl …` cannot run commands. The tag must also look like a version tag.
+        env:
+          V: ${{ needs.web.outputs.version }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          EVENT: ${{ github.event_name }}
+          RUN: ${{ github.run_number }}
         run: |
-          V='${{ needs.web.outputs.version }}'
-          if [[ -n "${{ inputs.tag }}" ]]; then TAG="${{ inputs.tag }}"
-          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then TAG="${GITHUB_REF#refs/tags/}"; else TAG="v$V-build.${{ github.run_number }}"; fi
+          if [[ -n "$INPUT_TAG" ]]; then
+            if [[ ! "$INPUT_TAG" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]; then echo "::error::Tag must look like v1.2.3 or v1.2.3-beta.1"; exit 1; fi
+            TAG="$INPUT_TAG"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then TAG="${GITHUB_REF#refs/tags/}"; else TAG="v$V-build.$RUN"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           # Tags: prerelease when the version has a suffix (v1.0.0-beta.1). Manual runs: the checkbox.
           # [release] commits: always a prerelease.
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then [[ "$TAG" == *-* ]] && PRE=true || PRE=false
-          elif [[ "${{ github.event_name }}" == workflow_dispatch ]]; then PRE='${{ inputs.prerelease }}'
+          elif [[ "$EVENT" == workflow_dispatch ]]; then PRE="$INPUT_PRERELEASE"
           else PRE=true; fi
           echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
           FAILED=""

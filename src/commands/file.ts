@@ -65,11 +65,15 @@ export async function openBuffer(app: App, data: ArrayBuffer, name: string, uri:
     tab.dirty = !!recovery;
     tab.recovery = recovery || null;
     if (fmt?.id === 'ppsx' || /\.pps[xm]?$/i.test(name)) tab.readOnly = false;
+    // File ▸ Info ▸ Always Open Read-Only.
+    const askedReadOnly = !recovery && deck.data.props.custom?.['quillstage:readOnly'] === '1';
+    if (askedReadOnly) tab.readOnly = true;
     if (!recovery) {
       addRecent(app, tab);
-      await kvSet('file:' + docKey(tab), { name, data, uri, when: Date.now() });
+      await cacheFile(tab, name, data, uri);
     }
     app.activate(tab);
+    if (askedReadOnly) toast(`${name} opens read-only, as its author asked.`, { action: 'Edit Anyway', onAction: () => { tab.readOnly = false; app.ui.tabsChanged(); app.refresh(); }, ms: 9000 });
     const details = () => openDialog({ title: 'Import Notes', content: Object.assign(document.createElement('pre'), { className: 'ql-notices', textContent: (warnings || []).join('\n') }), cancel: false });
     if (recovery) toast(`${name} was damaged. ${recoverySummary(recovery)}`, { action: 'Details', onAction: () => app.exec('file.recoveryReport'), ms: 9000 });
     else if (warnings?.length) toast(`Opened ${name} (${warnings.length} note${warnings.length > 1 ? 's' : ''})`, { action: 'Details', onAction: details, ms: 9000 });
@@ -94,8 +98,39 @@ function addRecent(app: App, tab: DeckTab) {
   app.savePrefs();
 }
 
-async function snapshot(_app: App, tab: DeckTab, label: string) {
-  await kvSet(`snap:${docKey(tab)}:${Date.now()}`, { label, json: tab.deck.toJSON(), when: Date.now(), name: tab.displayName });
+/** Snapshots kept per presentation (older ones are deleted). */
+export const SNAPSHOT_LIMIT = 10;
+
+/** Keeps the bytes last opened or saved, for Revert to Saved and Recent. Reports a full store instead of failing. */
+async function cacheFile(tab: DeckTab, name: string, data: ArrayBuffer, uri: string | null): Promise<boolean> {
+  try {
+    await kvSet('file:' + docKey(tab), { name, data, uri, when: Date.now() });
+    return true;
+  } catch (e) {
+    console.warn(e);
+    toast(`Could not keep a local copy of ${name} (storage may be full): Revert to Saved and Recent may not have it.`, { ms: 7000 });
+    return false;
+  }
+}
+
+/** Deletes all but the newest `keep` snapshots of a presentation. */
+export async function pruneSnapshots(key: string, keep = SNAPSHOT_LIMIT): Promise<void> {
+  const prefix = `snap:${key}:`;
+  const mine = (await kvKeys(prefix)).filter((k) => /^\d+$/.test(k.slice(prefix.length))).sort((a, b) => +b.slice(prefix.length) - +a.slice(prefix.length));
+  for (const k of mine.slice(keep)) await kvDel(k);
+}
+
+async function snapshot(_app: App, tab: DeckTab, label: string): Promise<boolean> {
+  const key = docKey(tab);
+  try {
+    await kvSet(`snap:${key}:${Date.now()}`, { label, json: tab.deck.toJSON(), when: Date.now(), name: tab.displayName });
+  } catch (e) {
+    console.warn(e);
+    toast('The snapshot could not be stored (storage may be full).');
+    return false;
+  }
+  try { await pruneSnapshots(key); } catch (e) { console.warn(e); }
+  return true;
 }
 
 export async function saveTab(app: App, tab: DeckTab, opts: { as?: boolean; format?: string; copy?: boolean } = {}): Promise<boolean> {
@@ -122,7 +157,14 @@ export async function saveTab(app: App, tab: DeckTab, opts: { as?: boolean; form
   const blob = toBlob(out.data, out.mime);
   if (!opts.as && !opts.copy && tab.uri && format === tab.format) {
     try {
-      if (await writeBack(tab.uri, blob)) { markSaved(app, tab, version); toast(`Saved ${tab.displayName}`); await snapshot(app, tab, 'Saved'); return true; }
+      if (await writeBack(tab.uri, blob)) {
+        markSaved(app, tab, version);
+        toast(`Saved ${tab.displayName}`);
+        // Revert to Saved must find what was just written, not the bytes first opened.
+        await cacheFile(tab, tab.fileName || name, out.data.buffer.slice(out.data.byteOffset, out.data.byteOffset + out.data.byteLength) as ArrayBuffer, tab.uri);
+        await snapshot(app, tab, 'Saved');
+        return true;
+      }
     } catch (e) { console.warn(e); }
   }
   const r = await saveAs(blob, name);
@@ -131,7 +173,7 @@ export async function saveTab(app: App, tab: DeckTab, opts: { as?: boolean; form
     tab.fileName = r.name; tab.title = r.name.replace(/\.[^.]+$/, ''); tab.format = formatFromName(r.name)?.id || format; tab.uri = r.uri;
     markSaved(app, tab, version);
     addRecent(app, tab);
-    await kvSet('file:' + docKey(tab), { name: r.name, data: out.data.buffer.slice(out.data.byteOffset, out.data.byteOffset + out.data.byteLength), uri: r.uri, when: Date.now() });
+    await cacheFile(tab, r.name, out.data.buffer.slice(out.data.byteOffset, out.data.byteOffset + out.data.byteLength) as ArrayBuffer, r.uri);
     await snapshot(app, tab, 'Saved');
   }
   toast(`Saved ${r.name}`);
@@ -312,7 +354,7 @@ def([
       toast('Creating the PDF…');
       const { deckToPdf } = await import('../export/pdf');
       const width = r.quality === 'small' ? 960 : r.quality === 'high' ? 2400 : 1600;
-      const pdf = await deckToPdf(app.deck, { kind: r.what, perPage: +r.perPage || 6, paper: r.paper, buildSteps: !!r.steps, hidden: !!r.hidden, imageWidth: width } as any);
+      const pdf = await deckToPdf(app.deck, { kind: r.what, perPage: +r.perPage || 6, paper: r.paper, buildSteps: !!r.steps, hidden: !!r.hidden, imageWidth: width, onWarning: (m: string) => toast(m, { ms: 8000 }) } as any);
       await saveBytes(pdf, `${baseName(app)}.pdf`, 'application/pdf');
     },
   },
@@ -456,7 +498,7 @@ def([
 
 def([
   {
-    id: 'file.properties', label: 'Properties…', icon: 'info', tab: 'Backstage', group: 'Info', noRecord: true,
+    id: 'file.properties', label: 'Properties…', icon: 'info', tab: 'Backstage', group: 'Info', noRecord: true, edits: true,
     run: async (app) => {
       const p = app.deck.data.props;
       const r = await openDialog({ title: 'Presentation Properties', wide: true, fields: [
@@ -475,7 +517,7 @@ def([
     },
   },
   {
-    id: 'file.inspect', label: 'Inspect Presentation…', icon: 'policy', tab: 'Backstage', group: 'Info', noRecord: true,
+    id: 'file.inspect', label: 'Inspect Presentation…', icon: 'policy', tab: 'Backstage', group: 'Info', noRecord: true, edits: true,
     tip: 'Find and remove comments, speaker notes, hidden slides, off-slide content, invisible objects and personal information before sharing',
     run: async (app) => {
       const d = app.deck;
@@ -559,20 +601,27 @@ def([
     run: async (app) => {
       const keys = (await kvKeys('draft:')).filter((k) => !app.docs.some((d) => 'draft:' + d.id === k));
       if (!keys.length) { toast('No unsaved drafts found.'); return; }
-      const drafts = await Promise.all(keys.map(async (k) => ({ k, d: await kvGet(k) })));
-      const r = await openDialog({ title: 'Presentation Recovery', fields: [{ key: 'k', label: 'Available drafts', type: 'list', multiple: true, rows: 8, options: drafts.map(({ k, d }) => ({ value: k, label: `${d.fileName || d.title} — ${new Date(d.time).toLocaleString()}` })), value: keys }], buttons: [{ label: 'Discard All', onClick: async (_v, ctl) => { for (const k of keys) await kvDel(k); ctl.close(); toast('Drafts discarded'); } }], ok: 'Recover' });
+      // One unreadable draft must not hide the others.
+      const drafts = (await Promise.all(keys.map(async (k) => { try { return { k, d: await kvGet(k) }; } catch { return { k, d: undefined }; } })))
+        .filter((x): x is { k: string; d: any } => !!x.d && typeof x.d === 'object' && !!x.d.json);
+      const bad = keys.length - drafts.length;
+      if (!drafts.length) { toast(bad ? `${bad} draft(s) could not be read.` : 'No unsaved drafts found.'); return; }
+      const r = await openDialog({ title: 'Presentation Recovery', fields: [{ key: 'k', label: 'Available drafts', type: 'list', multiple: true, rows: 8, options: drafts.map(({ k, d }) => ({ value: k, label: `${d.fileName || d.title || 'Presentation'} — ${d.time ? new Date(d.time).toLocaleString() : 'unknown time'}` })), value: drafts.map((x) => x.k) }], help: bad ? `${bad} damaged draft(s) could not be read; Discard All removes them too.` : undefined, buttons: [{ label: 'Discard All', onClick: async (_v, ctl) => { for (const k of keys) await kvDel(k); ctl.close(); toast('Drafts discarded'); } }], ok: 'Recover' });
       if (!r?.k?.length) return;
       for (const { k, d } of drafts.filter((x) => r.k.includes(x.k))) {
         try {
           const tab = app.createTab(Deck.fromJSON(d.json), { title: d.title, fileName: d.fileName, format: d.format, uri: d.uri, key: d.key || '' });
+          // Mark it changed so it is saved as a draft again (under the new tab) and asks to be saved on close.
           tab.dirty = true;
+          app.ui.tabsChanged();
+          app.scheduleAutosave();
           await kvDel(k);
-        } catch (e) { toast(`Could not restore ${d.title}: ${(e as Error).message}`); }
+        } catch (e) { toast(`Could not restore ${d.title || 'a draft'}: ${(e as Error).message}`); }
       }
     },
   },
   {
-    id: 'file.compressMedia', label: 'Compress Media…', icon: 'compress', tab: 'Backstage', group: 'Info', noRecord: true,
+    id: 'file.compressMedia', label: 'Compress Media…', icon: 'compress', tab: 'Backstage', group: 'Info', noRecord: true, edits: true,
     tip: 'Remove media no slide uses and report the size of the rest (pictures are re-encoded with Picture Format ▸ Compress Pictures)',
     run: async (app) => {
       const d = app.deck;
@@ -581,12 +630,20 @@ def([
       for (const s of d.slides) { walkEls(s.elements); if (s.bg?.type === 'image') used.add(s.bg.media); }
       for (const l of d.data.layouts) { walkEls(l.elements); if (l.bg?.type === 'image') used.add(l.bg.media); }
       for (const m of d.data.masters) { walkEls(m.elements); if (m.bg?.type === 'image') used.add(m.bg.media); }
+      // Media named anywhere else in the document (notes, comments, themes) also stays.
+      const now = JSON.stringify(d.data);
+      // Undo and Redo restore earlier states, which may use media no slide uses now.
+      const stacks = [(d as any).undoStack, (d as any).redoStack];
+      const canScan = stacks.every(Array.isArray);
+      const past = canScan ? JSON.stringify(stacks) : '';
+      for (const k of Object.keys(d.media)) if (now.includes(`"${k}"`) || past.includes(`"${k}"`)) used.add(k);
       const unused = Object.keys(d.media).filter((k) => !used.has(k));
-      const size = (ks: string[]) => ks.reduce((a, k) => a + Math.floor((d.media[k].b64.length * 3) / 4), 0);
+      const size = (ks: string[]) => ks.reduce((a, k) => a + Math.floor(((d.media[k]?.b64?.length || 0) * 3) / 4), 0);
       const kb = (n: number) => `${(n / 1024).toFixed(0)} KB`;
       if (!unused.length) { toast(`All ${used.size} media files are in use (${kb(size([...used]))}).`); return; }
-      if (!(await confirmDialog('Compress Media', `${unused.length} media file(s) are not used by any slide (${kb(size(unused))}). Remove them?`, 'Remove'))) return;
+      if (!(await confirmDialog('Compress Media', `${unused.length} media file(s) are not used by any slide (${kb(size(unused))}). Remove them?${canScan ? '' : ' Undo history will be cleared.'}`, 'Remove'))) return;
       for (const k of unused) delete d.media[k];
+      if (!canScan) d.clearHistory();
       d.changed();
       toast(`Removed ${unused.length} unused media file(s).`);
     },
@@ -643,6 +700,8 @@ def([
         autoLists: r.autoLists, autoCorrect: r.autoCorrect, autoCapitalize: r.autoCapitalize, presenterView: r.presenterView, showEndBlack: r.showEndBlack, penColor: r.penColor, laserColor: r.laserColor,
         autosave: r.autosave, autosaveSeconds: Math.max(3, r.autosaveSeconds || 10), confirmClose: r.confirmClose, spellcheck: r.spellcheck, spellDialect: r.spellDialect,
       });
+      // Clamp the numbers typed into the form (NaN falls back to the default).
+      Object.assign(p, sanitizePrefs({ uiScale: p.uiScale, gridSize: p.gridSize, autosaveSeconds: p.autosaveSeconds }));
       app.savePrefs();
       app.ui.applyPrefs();
     },

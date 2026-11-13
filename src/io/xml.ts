@@ -143,3 +143,55 @@ export const MIME_EXT: Record<string, string> = {
   'image/png': 'png', 'image/jpeg': 'jpeg', 'image/gif': 'gif', 'image/bmp': 'bmp', 'image/webp': 'webp', 'image/svg+xml': 'svg', 'image/x-emf': 'emf', 'image/x-wmf': 'wmf', 'image/tiff': 'tiff',
   'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov', 'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'audio/mp4': 'm4a', 'audio/ogg': 'ogg', 'video/x-ms-wmv': 'wmv', 'video/x-msvideo': 'avi', 'audio/x-ms-wma': 'wma',
 };
+
+/**
+ * Intrinsic size of a PNG, JPEG, GIF or BMP image in points, from its header and (when present)
+ * its resolution (PNG pHYs, JFIF density, BMP pixels-per-meter); 96 dpi otherwise. Null when the
+ * format or header is not recognised.
+ */
+export function imageSizePt(u8: Uint8Array): { w: number; h: number } | null {
+  const be32 = (o: number) => (o + 4 <= u8.length ? ((u8[o] << 24) | (u8[o + 1] << 16) | (u8[o + 2] << 8) | u8[o + 3]) >>> 0 : 0);
+  const be16 = (o: number) => (o + 2 <= u8.length ? (u8[o] << 8) | u8[o + 1] : 0);
+  const le16 = (o: number) => (o + 2 <= u8.length ? u8[o] | (u8[o + 1] << 8) : 0);
+  const le32 = (o: number) => (o + 4 <= u8.length ? u8[o] | (u8[o + 1] << 8) | (u8[o + 2] << 16) | (u8[o + 3] << 24) : 0);
+  const out = (pw: number, ph: number, dx = 96, dy = dx) => {
+    if (!(pw > 0 && ph > 0)) return null;
+    const ok = (d: number) => (d >= 10 && d <= 10000 ? d : 96);
+    return { w: (pw * 72) / ok(dx), h: (ph * 72) / ok(dy) };
+  };
+  if (u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4e && u8[3] === 0x47) {
+    const w = be32(16), h = be32(20);
+    let dx = 96, dy = 96;
+    for (let o = 8, n = 0; o + 12 <= u8.length && n < 1000; n++) {
+      const l = be32(o), t = String.fromCharCode(u8[o + 4], u8[o + 5], u8[o + 6], u8[o + 7]);
+      if (t === 'pHYs' && l >= 9 && u8[o + 16] === 1) { dx = be32(o + 8) * 0.0254; dy = be32(o + 12) * 0.0254; break; }
+      if (t === 'IDAT' || t === 'IEND') break;
+      o += 12 + l;
+    }
+    return out(w, h, dx, dy);
+  }
+  if (u8[0] === 0xff && u8[1] === 0xd8) {
+    let dx = 96, dy = 96;
+    for (let o = 2, n = 0; o + 9 < u8.length && n < 10000; n++) {
+      if (u8[o] !== 0xff) { o++; continue; }
+      const m = u8[o + 1];
+      if (m === 0xff) { o++; continue; }
+      if (m === 0xd8 || m === 0x01 || (m >= 0xd0 && m <= 0xd7)) { o += 2; continue; }
+      const l = be16(o + 2);
+      if (m === 0xe0 && l >= 14 && u8[o + 4] === 0x4a && u8[o + 5] === 0x46 && u8[o + 6] === 0x49 && u8[o + 7] === 0x46) {
+        const units = u8[o + 11], x = be16(o + 12), y = be16(o + 14);
+        if (units === 1 && x && y) { dx = x; dy = y; } else if (units === 2 && x && y) { dx = x * 2.54; dy = y * 2.54; }
+      }
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return out(be16(o + 7), be16(o + 5), dx, dy);
+      if (m === 0xda || l < 2) break;
+      o += 2 + l;
+    }
+    return null;
+  }
+  if (u8[0] === 0x47 && u8[1] === 0x49 && u8[2] === 0x46) return out(le16(6), le16(8));
+  if (u8[0] === 0x42 && u8[1] === 0x4d && u8.length > 46) {
+    const px = le32(38) * 0.0254, py = le32(42) * 0.0254;
+    return out(Math.abs(le32(18)), Math.abs(le32(22)), px || 96, py || 96);
+  }
+  return null;
+}

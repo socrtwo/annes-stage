@@ -65,18 +65,29 @@ export function openCfb(b: Uint8Array): Cfb | null {
   const maxSid = Math.max(0, Math.ceil((b.length - secSize) / secSize));
 
   // FAT sectors: 109 in the header, the rest in the DIFAT chain.
+  // Each FAT sector counts once and only sectors inside the file count, so a DIFAT that repeats
+  // entries (or loops) cannot make the table larger than the file itself.
+  // A repeated sector keeps its slot (as an empty FAT sector) so later entries keep their index.
+  const perSec = secSize / 4;
+  const maxFatSecs = Math.ceil(maxSid / perSec) + 1;
   const fatSids: number[] = [];
-  for (let k = 0; k < 109; k++) { const s = u32(0x4c + k * 4); if (s < maxSid) fatSids.push(s); }
+  const fatSeen = new Set<number>();
+  const addFat = (s: number) => {
+    if (s >= maxSid || fatSids.length >= maxFatSecs) return;
+    if (fatSeen.has(s)) { fatSids.push(-1); return; }
+    fatSeen.add(s); fatSids.push(s);
+  };
+  for (let k = 0; k < 109; k++) addFat(u32(0x4c + k * 4));
   const seen = new Set<number>();
-  for (let d = difatStart; d < maxSid && !seen.has(d) && seen.size < 1e5; ) {
+  for (let d = difatStart; d < maxSid && !seen.has(d) && seen.size <= maxSid; ) {
     seen.add(d);
     const off = secOff(d), per = secSize / 4 - 1;
-    for (let k = 0; k < per; k++) { const s = u32(off + k * 4); if (s < maxSid) fatSids.push(s); }
+    for (let k = 0; k < per; k++) addFat(u32(off + k * 4));
     d = u32(off + per * 4);
   }
-  const perSec = secSize / 4;
+  while (fatSids.length && fatSids[fatSids.length - 1] < 0) fatSids.pop();
   const fat = new Uint32Array(fatSids.length * perSec).fill(ENDOFCHAIN);
-  fatSids.forEach((sid, n) => { const off = secOff(sid); for (let k = 0; k < perSec; k++) fat[n * perSec + k] = u32(off + k * 4); });
+  fatSids.forEach((sid, n) => { if (sid < 0) return; const off = secOff(sid); for (let k = 0; k < perSec; k++) fat[n * perSec + k] = u32(off + k * 4); });
 
   const chain = (start: number, table: Uint32Array, limit: number, label: string): number[] => {
     const out: number[] = [];

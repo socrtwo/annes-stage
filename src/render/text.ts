@@ -145,10 +145,14 @@ function layoutOnce(paras: Paragraph[], o: LayoutOptions, scale: number): Omit<L
     const merged = { ...st, ...stripUndef(p) } as LevelStyle & Paragraph;
     const bullet = p.bullet ?? st.bullet;
     // Numbering restarts when a paragraph at a lower level or without numbering intervenes.
+    // Empty paragraphs show no bullet and neither take a number nor restart the numbering.
+    const hasText = p.runs.some((r) => r.text || r.br || r.field);
     counters.length = Math.max(counters.length, p.level + 1);
-    for (let k = p.level + 1; k < counters.length; k++) counters[k] = 0;
-    const isNum = bullet?.kind === 'num';
-    if (isNum) counters[p.level] = (counters[p.level] || 0) + 1; else counters[p.level] = 0;
+    if (hasText) {
+      for (let k = p.level + 1; k < counters.length; k++) counters[k] = 0;
+      const isNum = bullet?.kind === 'num';
+      if (isNum) counters[p.level] = (counters[p.level] || 0) + 1; else counters[p.level] = 0;
+    }
     const marL = (merged.marL ?? 0);
     const indent = (merged.indent ?? 0);
     const spBefore = (merged.spaceBefore ?? 0) * scale;
@@ -156,7 +160,6 @@ function layoutOnce(paras: Paragraph[], o: LayoutOptions, scale: number): Omit<L
     const align = merged.align || 'l';
     const baseRun = st.run || {};
     const endSize = ((p.end?.size ?? baseRun.size ?? 18)) * scale;
-    const hasText = p.runs.some((r) => r.text || r.br);
     // Build tokens: words and spaces with their run style.
     type Tok = { text: string; style: RunProps; size: number; font: string; css: string; run: number; br?: boolean; space: boolean };
     const toks: Tok[] = [];
@@ -167,8 +170,13 @@ function layoutOnce(paras: Paragraph[], o: LayoutOptions, scale: number): Omit<L
       const css = cssFont(s, size, fam);
       if (r.br) { toks.push({ text: '', style: s, size, font: fam, css, run: ri, br: true, space: false }); return; }
       let text = r.field === 'slidenum' && o.fields?.slidenum ? o.fields.slidenum : (r.field === 'datetime' || r.field === 'date') && o.fields?.date ? o.fields.date : r.text;
+      text = typeof text === 'string' ? text : String(text ?? '');
       if (s.caps === 'all') text = text.toUpperCase();
-      for (const part of text.split(/(\s+)/)) if (part) toks.push({ text: part, style: s, size, font: fam, css, run: ri, space: /^\s+$/.test(part) });
+      // A vertical tab (soft return in PowerPoint text) is a line break.
+      text.split('\u000B').forEach((piece, k) => {
+        if (k > 0) toks.push({ text: '', style: s, size, font: fam, css, run: ri, br: true, space: false });
+        for (const part of piece.split(/(\s+)/)) if (part) toks.push({ text: part, style: s, size, font: fam, css, run: ri, space: /^\s+$/.test(part) });
+      });
     });
     const bText = hasText && bullet ? bulletText(bullet, Math.max(0, (counters[p.level] || 1) - 1)) : '';
     const firstSize = toks.find((t) => !t.br)?.size ?? endSize;
@@ -181,6 +189,8 @@ function layoutOnce(paras: Paragraph[], o: LayoutOptions, scale: number): Omit<L
     let lineToks: Tok[] = [];
     let first = true;
     let lineW = 0;
+    /** The current line starts after a wrap (not at the paragraph start or a line break). */
+    let wrapped = false;
     const left = (fst: boolean) => (fst ? firstLeft : Math.max(0, marL));
     const avail = (fst: boolean) => Math.max(1, o.width - left(fst));
     const flush = () => {
@@ -212,20 +222,23 @@ function layoutOnce(paras: Paragraph[], o: LayoutOptions, scale: number): Omit<L
       lineToks = [];
       lineW = 0;
       first = false;
+      wrapped = false;
     };
     for (const t of toks) {
       if (t.br) { lineToks.push(t); flush(); continue; }
       const w = m(t.text, t.css);
       if (o.wrap !== false && !t.space && lineW + w > avail(first) && lineToks.some((x) => !x.space)) {
         flush();
+        wrapped = true;
       }
-      if (!t.space || lineToks.length) {
+      // Spaces at a wrap are dropped; spaces typed at the start of a paragraph or line are kept.
+      if (!t.space || lineToks.length || !wrapped) {
         // A word longer than the line is broken by characters.
         if (!t.space && w > avail(first) && o.wrap !== false) {
           let chunk = '';
           for (const ch of t.text) {
             const cw = m(chunk + ch, t.css);
-            if (cw > avail(first) - lineW && chunk) { lineToks.push({ ...t, text: chunk }); flush(); chunk = ch; }
+            if (cw > avail(first) - lineW && chunk) { lineToks.push({ ...t, text: chunk }); flush(); wrapped = true; chunk = ch; }
             else chunk += ch;
           }
           if (chunk) { lineToks.push({ ...t, text: chunk }); lineW += m(chunk, t.css); }

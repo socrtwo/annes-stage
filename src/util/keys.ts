@@ -31,9 +31,17 @@ export function keyName(e: KeyboardEvent): string | null {
   return parts.join('-');
 }
 
-export function canonicalKey(k: string): string {
+/** Splits a binding into modifiers and base key; the base key itself may be "-" (as in "Mod--"). */
+export function splitKey(k: string): { mods: string[]; base: string } {
+  if (k === '-') return { mods: [], base: '-' };
+  if (k.endsWith('--')) return { mods: k.slice(0, -2).split('-').filter(Boolean), base: '-' };
   const parts = k.split('-');
   const base = parts.pop()!;
+  return { mods: parts.filter(Boolean), base };
+}
+
+export function canonicalKey(k: string): string {
+  const { mods: parts, base } = splitKey(k);
   // Ctrl means Mod everywhere except macOS, where it is its own modifier.
   const mac = isMac();
   const mods = new Set(parts.map((p) => (p === 'Cmd' || p === 'Meta' || (p === 'Ctrl' && !mac) ? 'Mod' : p)));
@@ -45,5 +53,6 @@ export function canonicalKey(k: string): string {
 
 export function prettyKey(k: string): string {
   const mac = isMac();
-  return k.split('-').map((p) => (p === 'Mod' ? (mac ? '⌘' : 'Ctrl') : p === 'Ctrl' && mac ? '⌃' : p === 'Alt' ? (mac ? '⌥' : 'Alt') : p === 'Shift' ? (mac ? '⇧' : 'Shift') : p.length === 1 ? p.toUpperCase() : p)).join(mac ? '' : '+');
+  const { mods, base } = splitKey(k);
+  return [...mods, base].map((p, i) => (i === mods.length ? (p.length === 1 ? p.toUpperCase() : p) : p === 'Mod' ? (mac ? '⌘' : 'Ctrl') : p === 'Ctrl' && mac ? '⌃' : p === 'Alt' ? (mac ? '⌥' : 'Alt') : p === 'Shift' ? (mac ? '⇧' : 'Shift') : p)).join(mac ? '' : '+');
 }

@@ -14,64 +14,12 @@ export function isSafeExternalUrl(url: string): boolean {
   return SAFE_SCHEMES.test(u);
 }
 
-/** True for URLs that must never be stored or followed (script-capable schemes). */
-export function isScriptUrl(url: string): boolean {
-  // Browsers ignore whitespace and control characters inside the scheme.
-  const u = url.replace(/[\u0000- \u007f-\u009f]+/g, '').toLowerCase();
-  return /^(javascript|vbscript|livescript):/.test(u) || /^data:(text\/html|application\/xhtml|image\/svg)/.test(u);
-}
+/** Characters that are not allowed in XML 1.0 (SVG parsed as XML fails on them). */
+const XML_ILLEGAL = /[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]/g;
 
-// Form controls stay (task-list checkboxes): without on* attributes they cannot run script.
-const DANGEROUS_TAGS = 'script,iframe,frame,frameset,object,embed,applet,base,link,meta,noscript,template,portal';
-const URL_ATTRS = new Set(['href', 'src', 'xlink:href', 'action', 'formaction', 'poster', 'background', 'lowsrc', 'dynsrc', 'data', 'cite', 'longdesc']);
-
-/**
- * Remove script vectors from a DOM subtree in place: event-handler attributes, script-capable
- * URLs, srcdoc, and elements that execute or load active content.
- */
-export function stripActiveContent(root: Element | DocumentFragment): void {
-  root.querySelectorAll(DANGEROUS_TAGS).forEach((el) => {
-    // Keep MathJax sources (handled by the HTML importer before this runs).
-    if (el.tagName === 'SCRIPT' && /^math\/tex/.test(el.getAttribute('type') || '')) return;
-    el.remove();
-  });
-  const all = root instanceof Element ? [root, ...root.querySelectorAll('*')] : [...root.querySelectorAll('*')];
-  for (const el of all) {
-    for (const a of [...el.attributes]) {
-      const n = a.name.toLowerCase();
-      if (n.startsWith('on') || n === 'srcdoc' || n === 'formaction') el.removeAttribute(a.name);
-      else if (URL_ATTRS.has(n) && isScriptUrl(a.value)) el.removeAttribute(a.name);
-      else if (n === 'style' && /expression\s*\(|javascript:|behavior\s*:|-moz-binding/i.test(a.value)) el.removeAttribute(a.name);
-    }
-  }
-}
-
-const GEN_TAGS = new Set(['P', 'SPAN', 'A', 'B', 'I', 'EM', 'STRONG', 'U', 'SUP', 'SUB', 'BR', 'DIV', 'SMALL']);
-const SAFE_STYLE = /^[\w\s:;.,%#()'"-]*$/;
-
-/**
- * Allow-list sanitizer for generated-block caches (TOC, index, bibliography...): only the
- * tags and attributes Anne's Stage itself generates survive.
- */
-export function sanitizeGeneratedHtml(html: string): string {
-  if (!html) return '';
-  const t = document.createElement('template');
-  t.innerHTML = html;
-  const walk = (parent: ParentNode) => {
-    for (const node of [...parent.childNodes]) {
-      if (node.nodeType === 3) continue;
-      if (node.nodeType !== 1) { node.remove(); continue; }
-      const el = node as Element;
-      walk(el);
-      if (!GEN_TAGS.has(el.tagName)) { el.replaceWith(...el.childNodes); continue; }
-      for (const a of [...el.attributes]) {
-        const keep = a.name === 'class' || (a.name === 'href' && a.value.startsWith('#')) || (a.name === 'style' && SAFE_STYLE.test(a.value) && !/url\s*\(|expression/i.test(a.value));
-        if (!keep) el.removeAttribute(a.name);
-      }
-    }
-  };
-  walk(t.content);
-  return t.innerHTML;
+/** Escape text for XML/SVG content and quoted attribute values, dropping XML-illegal characters. */
+export function escXml(s: unknown): string {
+  return String(s ?? '').replace(XML_ILLEGAL, '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 /** Escape text for HTML element content and quoted attribute values. */

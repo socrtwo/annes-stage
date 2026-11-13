@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and older (android:fullBackupContent). API keys are encrypted with a key that never
+     leaves this device's Keystore, so their ciphertext is useless elsewhere: keep it out of backups. -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="quillstage.secure.xml" />
+</full-backup-content>

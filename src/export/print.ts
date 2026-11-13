@@ -100,7 +100,11 @@ export function printPages(deck: Deck, o: PrintOptions): { css: string; pages: s
 /** Prints the presentation through the system print dialog. */
 export async function printDeck(app: App, o: PrintOptions): Promise<void> {
   const { css, pages } = printPages(app.deck, o);
-  if (!pages.length) return;
+  if (!pages.length) {
+    const r = parseRange(o.range, app.deck.slides.length);
+    if (r && !r.size) throw new Error(`No slides match "${o.range}": this presentation has ${app.deck.slides.length} slide${app.deck.slides.length === 1 ? '' : 's'}.`);
+    throw new Error(r ? 'Every slide in that range is hidden; turn on "Print hidden slides" to print them.' : 'There are no slides to print.');
+  }
   const style = document.createElement('style');
   style.id = 'qs-print-css';
   style.textContent = `@media screen { .qs-print-root { display: none } }

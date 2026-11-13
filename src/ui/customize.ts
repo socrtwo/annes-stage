@@ -94,7 +94,7 @@ export async function customizeQat(app: App): Promise<void> {
   const r = await openDialog({
     title: 'Customize the Quick Access Bar', full: true, content: root,
     fields: [
-      { key: 'bottom', label: 'Show the Quick Access Bar at the bottom (near the keyboard)', type: 'checkbox', value: app.prefs.qatPosition === 'bottom' },
+      { key: 'pos', label: 'Show the Quick Access Bar', type: 'select', options: [{ value: 'top', label: 'Above the ribbon' }, { value: 'below', label: 'Below the ribbon' }, { value: 'bottom', label: 'At the bottom (near the keyboard)' }], value: app.prefs.qatPosition },
       { key: 'labels', label: 'Show command labels', type: 'checkbox', value: app.prefs.qatLabels },
     ],
     buttons: [
@@ -104,7 +104,7 @@ export async function customizeQat(app: App): Promise<void> {
   });
   if (!r) return;
   app.prefs.qat = qat;
-  app.prefs.qatPosition = r.bottom ? 'bottom' : 'top';
+  if (r.pos === 'top' || r.pos === 'below' || r.pos === 'bottom') app.prefs.qatPosition = r.pos;
   app.prefs.qatLabels = r.labels;
   app.savePrefs();
   app.ui.applyPrefs();

@@ -5,7 +5,8 @@
 import type { App } from '../app';
 import type { Element, Fill, GroupElement, Layout, Line, Master, Paragraph, ParaProps, RunProps, ShapeElement, Slide, TextBody } from '../model/types';
 import { clone, newId } from '../model/deck';
-import { resolveBox, isSlide, type Box } from '../model/inherit';
+import { resolveBox, resolveBody, resolveFillLine, levelStyle, chain, isSlide, type Box } from '../model/inherit';
+import type { Deck } from '../model/deck';
 import { toast } from '../ui/dialog';
 import { activeTextEditor } from './textEdit';
 
@@ -45,8 +46,56 @@ export function setBox(app: App, el: Element, b: Partial<Box>): void {
     };
     walk(el.children);
   }
-  el.x = round(nb.x); el.y = round(nb.y); el.w = round(Math.max(1, nb.w)); el.h = round(Math.max(1, nb.h));
+  if (b.flipH != null) el.flipH = b.flipH || undefined;
+  if (b.flipV != null) el.flipV = b.flipV || undefined;
+  let { x, y, w, h } = nb;
+  if (isLineLike(el)) {
+    // Lines and connectors may be 0 wide or high; a negative extent mirrors the line.
+    if (w < 0) { x += w; w = -w; el.flipH = !el.flipH || undefined; }
+    if (h < 0) { y += h; h = -h; el.flipV = !el.flipV || undefined; }
+  } else { w = Math.max(1, w); h = Math.max(1, h); }
+  el.x = round(x); el.y = round(y); el.w = round(w); el.h = round(h);
   if (b.rot != null) el.rot = ((b.rot % 360) + 360) % 360 || undefined;
+}
+
+const LINE_GEOM = /^(line|straightConnector1|bentConnector\d|curvedConnector\d)$/;
+/** Lines and connectors: their box may have no width or no height. */
+export function isLineLike(el: Element): boolean {
+  return el.kind === 'shape' && LINE_GEOM.test(el.geom);
+}
+
+/** Elements in the owner's stacking order (back to front), whatever order they were selected in. */
+export function inZOrder(owner: Owner | null | undefined, els: Element[]): Element[] {
+  if (!owner) return [...els];
+  const idx = new Map(owner.elements.map((e, i) => [e.id, i] as const));
+  return [...els].sort((a, b) => (idx.get(a.id) ?? Infinity) - (idx.get(b.id) ?? Infinity));
+}
+
+/**
+ * Turns a copy of a placeholder into an ordinary shape that looks the same: its box, geometry, fill,
+ * outline, body properties and per-level text styles (which a placeholder inherits from its layout
+ * and master) are written into the copy, and `ph` is removed.
+ */
+export function detachPlaceholder(deck: Deck, owner: Owner, src: Element, copy: Element): void {
+  if (!copy.ph) return;
+  const b = resolveBox(deck, owner, src);
+  Object.assign(copy, { x: b.x, y: b.y, w: b.w, h: b.h });
+  if (copy.kind === 'shape' && src.kind === 'shape') {
+    const ch = chain(deck, owner, src) as ShapeElement[];
+    copy.geom = ch.map((e) => e.geom).find((g) => g && g !== 'rect') || copy.geom || 'rect';
+    if (copy.adj == null) { const adj = ch.find((e) => e.adj)?.adj; if (adj) copy.adj = clone(adj); }
+    // Placeholders default to no fill and no line; ordinary shapes to the accent fill.
+    const fl = resolveFillLine(deck, owner, src);
+    copy.fill = clone(fl.fill ?? { type: 'none' });
+    copy.line = clone(fl.line ?? {});
+    const body = resolveBody(deck, owner, src);
+    const levels = Array.from({ length: 9 }, (_, lv) => clone(levelStyle(deck, owner, src, lv)));
+    const t: TextBody = copy.text ? { ...copy.text } : { paras: [{ level: 0, runs: [] }] };
+    for (const [k, v] of Object.entries(body)) if (v !== undefined && (t as any)[k] == null) (t as any)[k] = clone(v);
+    t.levels = levels;
+    copy.text = t;
+  }
+  delete copy.ph;
 }
 
 const round = (v: number) => Math.round(v * 100) / 100;
@@ -190,11 +239,16 @@ export function deleteSelection(app: App): void {
 }
 
 export function duplicateSelection(app: App, dx = 12, dy = 12): void {
-  const sel = selection(app);
+  const sel = inZOrder(app.owner, selection(app));
   if (!sel.length) return;
   const copies = sel.map((e) => reId(clone(e)));
   edit(app, 'Duplicate', (o) => {
-    for (const c of copies) { if (c.x != null) c.x += dx; if (c.y != null) c.y += dy; if (c.ph) { const b = resolveBox(app.deck, o, sel[copies.indexOf(c)]); Object.assign(c, { x: b.x + dx, y: b.y + dy, w: b.w, h: b.h }); delete c.ph; } o.elements.push(c); }
+    copies.forEach((c, i) => {
+      if (c.ph) detachPlaceholder(app.deck, o, sel[i], c);
+      if (c.x != null) c.x += dx; if (c.y != null) c.y += dy;
+      if (c.kind === 'group') shiftChildren(c, dx, dy);
+      o.elements.push(c);
+    });
   });
   app.tab.ui.select(copies.map((c) => c.id));
 }
@@ -250,7 +304,7 @@ export function align(app: App, how: AlignHow, toSlide = false): void {
 }
 
 export function group(app: App): void {
-  const sel = selection(app);
+  const sel = inZOrder(app.owner, selection(app));
   if (sel.length < 2) { toast('Select two or more objects to group.'); return; }
   const boxes = sel.map((e) => boxOf(app, e));
   const x = Math.min(...boxes.map((b) => b.x)), y = Math.min(...boxes.map((b) => b.y));
@@ -259,7 +313,7 @@ export function group(app: App): void {
   const ids = new Set(sel.map((e) => e.id));
   edit(app, 'Group', (o) => {
     const first = o.elements.findIndex((e) => ids.has(e.id));
-    g.children = sel.map((e, i) => { const c = clone(e); Object.assign(c, { x: boxes[i].x, y: boxes[i].y, w: boxes[i].w, h: boxes[i].h }); delete c.ph; return c; });
+    g.children = sel.map((e, i) => { const c = clone(e); if (c.ph) detachPlaceholder(app.deck, o, e, c); Object.assign(c, { x: boxes[i].x, y: boxes[i].y, w: boxes[i].w, h: boxes[i].h }); return c; });
     o.elements = o.elements.filter((e) => !ids.has(e.id));
     o.elements.splice(Math.max(0, first), 0, g);
   });
@@ -273,11 +327,48 @@ export function ungroup(app: App): void {
   edit(app, 'Ungroup', (o) => {
     for (const g of groups) {
       const i = o.elements.indexOf(g);
+      if (i < 0) continue;
+      for (const c of g.children) releaseChild(g, c);
       o.elements.splice(i, 1, ...g.children);
       ids.push(...g.children.map((c) => c.id));
     }
   });
   app.tab.ui.select(ids);
+}
+
+/** Moves a group's descendants (stored in slide coordinates). */
+function shiftChildren(g: GroupElement, dx: number, dy: number): void {
+  for (const c of g.children) {
+    if (c.x != null) c.x = round(c.x + dx);
+    if (c.y != null) c.y = round(c.y + dy);
+    if (c.kind === 'group') shiftChildren(c, dx, dy);
+  }
+}
+
+/**
+ * Applies a group's rotation and flips to a child about to leave it, so it stays where it was drawn:
+ * the child's centre is mirrored and rotated about the group's centre, the group's rotation is added
+ * to the child's (negated first when the group mirrors in one direction), and the flips are toggled.
+ */
+export function releaseChild(g: GroupElement, c: Element): void {
+  const rot = g.rot || 0, fh = !!g.flipH, fv = !!g.flipV;
+  if (!rot && !fh && !fv) return;
+  const gcx = (g.x ?? 0) + (g.w ?? 0) / 2, gcy = (g.y ?? 0) + (g.h ?? 0) / 2;
+  const x0 = c.x ?? 0, y0 = c.y ?? 0, w = c.w ?? 0, h = c.h ?? 0;
+  let cx = x0 + w / 2, cy = y0 + h / 2;
+  if (fh) cx = 2 * gcx - cx;
+  if (fv) cy = 2 * gcy - cy;
+  const a = (rot * Math.PI) / 180, vx = cx - gcx, vy = cy - gcy;
+  const nx = gcx + vx * Math.cos(a) - vy * Math.sin(a), ny = gcy + vx * Math.sin(a) + vy * Math.cos(a);
+  const dx = nx - w / 2 - x0, dy = ny - h / 2 - y0;
+  c.x = round(x0 + dx); c.y = round(y0 + dy);
+  if (c.kind === 'group') shiftChildren(c, dx, dy);
+  let r = c.rot || 0;
+  if (fh !== fv) r = -r;
+  r = round((((r + rot) % 360) + 360) % 360);
+  c.rot = r && r !== 360 ? r : undefined;
+  if (fh) c.flipH = !c.flipH || undefined;
+  if (fv) c.flipV = !c.flipV || undefined;
 }
 
 export function rotateSelection(app: App, deg: number | 'flipH' | 'flipV'): void {

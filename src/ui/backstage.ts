@@ -97,7 +97,7 @@ export function renderBackstage(app: App, root: HTMLElement, page: string): void
     case 'export': {
       body.append(h('h1', null, page === 'saveas' ? 'Save As' : 'Export'), h('p', { class: 'ql-help' }, page === 'saveas' ? 'Choose a format. The system file dialog lets you pick the folder (device, SD card, Drive, Dropbox…).' : 'Save a copy in another format; the current presentation keeps its file.'));
       const grid = h('div', { class: 'ql-bs-cards' });
-      for (const f of FORMATS.filter((x) => x.canExport)) grid.appendChild(card(f.label, `.${f.ext[0]}`, 'description', () => (page === 'saveas' ? app.exec('file.saveAsFormat', f.id) : app.exec('file.exportAs', f.id))));
+      for (const f of FORMATS.filter((x) => x.canExport)) grid.appendChild(card(f.label, `.${f.ext[0]}`, 'description', () => (page === 'saveas' ? app.exec('file.saveAsFormat', f.id) : app.exec(`file.export.${f.id}`))));
       grid.appendChild(card('PDF', 'Slides, handouts, notes pages or outline', 'picture_as_pdf', () => app.exec('file.export.pdf')));
       grid.appendChild(card('Pictures', 'PNG, JPEG or SVG of each slide', 'image', () => app.exec('file.export.images')));
       grid.appendChild(card('HTML Show', 'One web page that plays the presentation anywhere', 'html', () => app.exec('file.export.htmlShow')));

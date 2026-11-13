@@ -49,42 +49,118 @@ export function linesOf(s: string): string[] {
   return cleanText(s).split(/\r?\n/).map((l) => l.replace(/^\s*(?:[-*•–]|\d+[.)])\s+/, '').trimEnd()).filter((l) => l.trim());
 }
 
-/** Parses JSON that may be wrapped in prose or code fences. */
-export function parseJsonLoose<T = any>(s: string): T | null {
-  const t = cleanText(s);
-  try { return JSON.parse(t); } catch { /* look inside */ }
-  const a = t.indexOf('['), o = t.indexOf('{');
-  const start = a >= 0 && (o < 0 || a < o) ? a : o;
-  if (start < 0) return null;
-  const close = t[start] === '[' ? ']' : '}';
-  const end = t.lastIndexOf(close);
-  if (end <= start) return null;
-  try { return JSON.parse(t.slice(start, end + 1)); } catch { return null; }
+/** Removes the reasoning some models print before the answer (<think>…</think>, also an unclosed one at the start). */
+export function stripThinking(s: string): string {
+  return String(s ?? '').replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '').replace(/^\s*<think(?:ing)?>[\s\S]*$/i, '').trim();
 }
 
-/** Parses an outline answer: JSON first, then Markdown headings and bullets. */
+/**
+ * Scans a JSON value starting at `start` ('[' or '{'), honoring strings. Returns the end index of the
+ * balanced value, -1 when the text ends first or -2 when the brackets do not match; `lastItem` is the end of the last complete
+ * top-level element of an array (for repairing an answer that was cut off).
+ */
+function scanJson(t: string, start: number): { end: number; lastItem: number } {
+  const stack: string[] = [];
+  let inStr = false;
+  let lastItem = -1;
+  for (let i = start; i < t.length; i++) {
+    const c = t[i];
+    if (inStr) {
+      if (c === '\\') i++;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '[' || c === '{') stack.push(c === '[' ? ']' : '}');
+    else if (c === ']' || c === '}') {
+      if (stack.pop() !== c) return { end: -2, lastItem: -1 };
+      if (!stack.length) return { end: i, lastItem };
+      if (stack.length === 1 && t[start] === '[') lastItem = i;
+    }
+  }
+  return { end: -1, lastItem };
+}
+
+/**
+ * Parses JSON that may be wrapped in prose, code fences or <think> blocks. Each '[' or '{' is tried
+ * as a start in turn, so a bracket in the prose ("[2 slides]") does not hide the real answer. An
+ * array that was cut off is repaired by keeping its complete elements.
+ */
+export function parseJsonLoose<T = any>(s: string): T | null {
+  const t = cleanText(stripThinking(s));
+  try { return JSON.parse(t); } catch { /* look inside */ }
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (c !== '[' && c !== '{') continue;
+    const { end, lastItem } = scanJson(t, i);
+    if (end > i) {
+      try { return JSON.parse(t.slice(i, end + 1)); } catch { /* next candidate */ }
+    } else if (end === -1 && c === '[' && lastItem > i) {
+      // Cut off (length limit): keep the complete elements rather than one element from inside.
+      try { return JSON.parse(t.slice(i, lastItem + 1) + ']'); } catch { /* next candidate */ }
+    }
+  }
+  return null;
+}
+
+/** Parses an outline answer: JSON first, then Markdown headings and bullets (never for an answer that is JSON). */
 export function parseOutline(s: string): OutlineSlide[] {
   const j = parseJsonLoose<any>(s);
   const arr = Array.isArray(j) ? j : Array.isArray(j?.slides) ? j.slides : null;
   if (arr) {
-    return arr.filter((x: any) => x && (x.title || x.bullets)).map((x: any) => ({
+    return arr.filter((x: any) => x && typeof x === 'object' && (x.title || x.bullets)).map((x: any) => ({
       title: String(x.title || '').trim(),
-      bullets: Array.isArray(x.bullets) ? x.bullets.map((b: any) => String(b)).filter((b: string) => b.trim()) : typeof x.bullets === 'string' ? x.bullets.split('\n') : [],
+      bullets: Array.isArray(x.bullets) ? x.bullets.map((b: any) => String(b)).filter((b: string) => b.trim()) : typeof x.bullets === 'string' ? x.bullets.split('\n').filter((b: string) => b.trim()) : [],
       notes: x.notes ? String(x.notes) : undefined,
     }));
   }
+  const text = cleanText(stripThinking(s));
+  // JSON that could not be read (or is not an outline) must not turn into slides of braces and quotes.
+  if (/^[[{]/.test(text)) return [];
   const out: OutlineSlide[] = [];
-  for (const raw of cleanText(s).split(/\r?\n/)) {
+  for (const raw of text.split(/\r?\n/)) {
     const line = raw.replace(/\s+$/, '');
     if (!line.trim()) continue;
     const head = /^\s*#{1,3}\s+(.*)$/.exec(line) || /^\s*(?:Slide\s*\d+\s*[:.-]\s*)(.*)$/i.exec(line);
     if (head) { out.push({ title: head[1].replace(/\*\*/g, '').trim(), bullets: [] }); continue; }
     const b = /^(\s*)(?:[-*•]|\d+[.)])\s+(.*)$/.exec(line);
-    if (!out.length) out.push({ title: b ? '' : line.trim(), bullets: [] });
+    const note = /^notes?:/i.test(line.trim());
+    if (!out.length) {
+      // The first plain line is the title of the first slide (and only that).
+      if (!b && !note) { out.push({ title: line.trim(), bullets: [] }); continue; }
+      out.push({ title: '', bullets: [] });
+    }
     if (b) out[out.length - 1].bullets.push(' '.repeat(Math.min(4, b[1].length >= 2 ? 2 : 0)) + b[2].trim());
-    else if (/^notes?:/i.test(line.trim())) out[out.length - 1].notes = line.trim().replace(/^notes?:\s*/i, '');
+    else if (note) out[out.length - 1].notes = line.trim().replace(/^notes?:\s*/i, '');
     else if (out[out.length - 1].title) out[out.length - 1].bullets.push(line.trim());
     else out[out.length - 1].title = line.trim();
   }
   return out.filter((x) => x.title || x.bullets.length);
+}
+
+export interface QuizQuestion { question: string; choices: string[]; answer: number | null }
+
+/** Reads a quiz answer defensively: choices must be a list of strings, the answer a whole-number index into it. */
+export function parseQuiz(s: string): QuizQuestion[] {
+  const j = parseJsonLoose<any>(s);
+  const arr = Array.isArray(j) ? j : Array.isArray(j?.questions) ? j.questions : [];
+  const out: QuizQuestion[] = [];
+  for (const q of arr) {
+    if (!q || typeof q !== 'object' || typeof q.question !== 'string' || !q.question.trim()) continue;
+    const choices = Array.isArray(q.choices) ? q.choices.filter((c: unknown) => typeof c === 'string' || typeof c === 'number').map((c: unknown) => String(c).trim()).filter(Boolean).slice(0, 7) : [];
+    const a = typeof q.answer === 'string' && /^\s*\d+\s*$/.test(q.answer) ? Number(q.answer) : q.answer;
+    const answer = Number.isInteger(a) && a >= 0 && a < choices.length ? (a as number) : null;
+    out.push({ question: q.question.trim(), choices, answer });
+  }
+  return out;
+}
+
+/** Question slides; the answer goes into the speaker notes. */
+export function quizOutline(qs: QuizQuestion[]): OutlineSlide[] {
+  const L = 'ABCDEFG';
+  return qs.map((q, i) => ({
+    title: `Question ${i + 1}: ${q.question}`,
+    bullets: q.choices.map((c, k) => `${L[k]}. ${c}`),
+    notes: q.answer == null ? 'Answer: ?' : `Answer: ${L[q.answer]}. ${q.choices[q.answer]}`,
+  }));
 }

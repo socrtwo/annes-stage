@@ -5,7 +5,7 @@ import type { Element, Paragraph, ShapeElement, Slide } from '../model/types';
 import { newId } from '../model/deck';
 import { edit, forEachText, textTargets } from '../edit/ops';
 import { openDialog, toast, confirmDialog } from '../ui/dialog';
-import { download, h } from '../ui/dom';
+import { download, h, esc } from '../ui/dom';
 import { resolveBox, levelStyle } from '../model/inherit';
 import { themeFont } from '../model/theme';
 import { FACES } from '../fonts';
@@ -75,7 +75,7 @@ def([
       for (const s of d.slides) for (const e of s.elements) { const b = resolveBox(d, s, e); if (b.x + b.w <= 0 || b.y + b.h <= 0 || b.x >= d.size.w || b.y >= d.size.h) found.push({ s, e }); }
       if (!found.length) { toast('Nothing lies outside the slides.'); return; }
       const r = await openDialog({ title: 'Off-Slide Content', fields: [
-        { key: 'i', type: 'info', html: `<p>${found.length} object(s) outside the slide:</p><ul>${found.slice(0, 15).map((f) => `<li>Slide ${d.slideIndex(f.s.id) + 1}: ${(f.e.name || f.e.kind).replace(/</g, '&lt;')}</li>`).join('')}</ul>` },
+        { key: 'i', type: 'info', html: `<p>${found.length} object(s) outside the slide:</p><ul>${found.slice(0, 15).map((f) => `<li>Slide ${d.slideIndex(f.s.id) + 1}: ${esc(f.e.name || f.e.kind)}</li>`).join('')}</ul>` },
         { key: 'act', label: 'Action', type: 'radio', options: [{ value: 'show', label: 'Go to the first one' }, { value: 'move', label: 'Move them onto their slides' }, { value: 'delete', label: 'Delete them' }], value: 'show' },
       ] });
       if (!r) return;
@@ -95,7 +95,7 @@ def([
       const d = app.deck, used = usedLayouts(app);
       const lays = d.data.layouts.filter((l) => !used.has(l.id));
       const masters = d.data.masters.filter((m) => !d.layoutsOf(m.id).some((l) => used.has(l.id)));
-      await openDialog({ title: 'Unused Masters and Layouts', ok: 'Close', cancel: false, buttons: lays.length ? [{ label: 'Remove Them', onClick: (_v, ctl) => { ctl.close(null); app.exec('tools.removeUnusedLayouts'); } }] : [], fields: [{ key: 'i', type: 'info', html: lays.length || masters.length ? `<p>Masters with no slides: ${masters.map((m) => m.name).join(', ') || 'none'}</p><p>Layouts with no slides (${lays.length}): ${lays.map((l) => l.name).join(', ')}</p>` : '<p>Every master and layout is used.</p>' }] });
+      await openDialog({ title: 'Unused Masters and Layouts', ok: 'Close', cancel: false, buttons: lays.length ? [{ label: 'Remove Them', onClick: (_v, ctl) => { ctl.close(null); app.exec('tools.removeUnusedLayouts'); } }] : [], fields: [{ key: 'i', type: 'info', html: lays.length || masters.length ? `<p>Masters with no slides: ${masters.map((m) => esc(m.name || '')).join(', ') || 'none'}</p><p>Layouts with no slides (${lays.length}): ${lays.map((l) => esc(l.name || '')).join(', ')}</p>` : '<p>Every master and layout is used.</p>' }] });
     },
   },
   {

@@ -12,13 +12,15 @@ import { deckFromOutline, type OutlineItem } from './outline';
 /** Parses inline Markdown (bold, italic, strike, code, links) into runs. */
 export function inlineRuns(text: string): Run[] {
   const runs: Run[] = [];
-  const re = /(\*\*|__)(.+?)\1|(\*|_)(?!\s)(.+?)\3|~~(.+?)~~|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
+  // Delimiters preceded by a backslash are literal; underscores only emphasise at word boundaries
+  // (snake_case_names stay as they are), as in CommonMark.
+  const re = /(?<!\\)\*\*(.+?)(?<!\\)\*\*|(?<![\p{L}\p{N}_\\])__(?!\s)(.+?)__(?![\p{L}\p{N}_])|(?<!\\)\*(?![\s*])(.+?)(?<!\\)\*|(?<![\p{L}\p{N}_\\])_(?![\s_])(.+?)_(?![\p{L}\p{N}_])|(?<!\\)~~(.+?)~~|(?<!\\)`([^`]+)`|(?<!\\)\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/gu;
   let last = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
     if (m.index > last) runs.push({ text: unescapeMd(text.slice(last, m.index)) });
-    if (m[2] != null) for (const r of inlineRuns(m[2])) runs.push({ ...r, b: true });
-    else if (m[4] != null) for (const r of inlineRuns(m[4])) runs.push({ ...r, i: true });
+    if (m[1] != null || m[2] != null) for (const r of inlineRuns((m[1] ?? m[2])!)) runs.push({ ...r, b: true });
+    else if (m[3] != null || m[4] != null) for (const r of inlineRuns((m[3] ?? m[4])!)) runs.push({ ...r, i: true });
     else if (m[5] != null) runs.push({ text: unescapeMd(m[5]), strike: true });
     else if (m[6] != null) runs.push({ text: m[6], font: 'Cousine' });
     else if (m[7] != null) runs.push({ text: unescapeMd(m[7]), link: m[8], u: true, color: 'hlink' });
@@ -28,7 +30,12 @@ export function inlineRuns(text: string): Run[] {
   return runs.filter((r) => r.text);
 }
 
-const unescapeMd = (s: string) => s.replace(/\\([\\`*_{}[\]()#+\-.!~|])/g, '$1');
+/** Backslash escapes: any ASCII punctuation (CommonMark). */
+const unescapeMd = (s: string) => s.replace(/\\([!-/:-@[-`{-~])/g, '$1');
+
+/** Lines of speaker notes are taken verbatim, except the escapes that keep them from ending the slide. */
+const NOTE_ESCAPED = /^(\s*)\\(?=(---|\*\*\*|___)\s*$|```|~~~)/;
+const NOTE_NEEDS_ESCAPE = /^(\s*)(?=(---|\*\*\*|___)\s*$|```|~~~)/;
 
 interface MdSlide { item: OutlineItem; images: { alt: string; src: string }[]; code: string[]; codeLang?: string }
 
@@ -69,7 +76,7 @@ export function parseMarkdown(md: string): { slides: MdSlide[]; front: Record<st
     let headingSeen = false;
     for (const raw of lines) {
       const line = raw.replace(/\s+$/, '');
-      if (inNotes) { notes.push(line); continue; }
+      if (inNotes) { notes.push(line.replace(NOTE_ESCAPED, '$1').replace(/<\\!--/g, '<!--')); continue; }
       if (/^\s*(```|~~~)/.test(line)) {
         if (!inCode) s.codeLang = line.replace(/^\s*(```|~~~)/, '').trim() || undefined;
         inCode = !inCode; continue;
@@ -159,10 +166,25 @@ export function importMarkdown(md: string): Deck {
 // ------------------------------------------------------------------------------------------
 // Export
 
+/**
+ * Escapes what would read back as structure at the start of a line: headings, rules, list
+ * markers, quotes, notes markers ("Note:", "???"). Inline markers are escaped by mdInline.
+ */
+function escapeLead(t: string): string {
+  if (/^#{1,6}(\s|$)/.test(t)) return '\\' + t;
+  if (/^(-{3,}|_{3,}|(\\\*){3,})\s*$/.test(t) || /^[-+](\s|$)/.test(t) || /^>/.test(t)) return '\\' + t;
+  const n = /^(\d+)([.)])(\s|$)/.exec(t);
+  if (n) return `${n[1]}\\${t.slice(n[1].length)}`;
+  if (/^\?\?\?/.test(t)) return '\\' + t;
+  const note = /^(notes?)(:)/i.exec(t);
+  if (note) return `${note[1]}\\${t.slice(note[1].length)}`;
+  return t;
+}
+
 function mdInline(runs: Run[]): string {
   return runs.map((r) => {
     if (r.br) return '  \n';
-    let t = r.text.replace(/([\\`*_[\]])/g, '\\$1');
+    let t = r.text.replace(/([\\`*_[\]~])/g, '\\$1').replace(/<!--/g, '<\\!--');
     if (!t.trim()) return t;
     if (r.font && /cousine|courier|mono|consolas/i.test(r.font)) t = '`' + r.text + '`';
     if (r.strike) t = `~~${t}~~`;
@@ -188,7 +210,8 @@ export function exportMarkdown(deck: Deck, opts: { embedImages?: boolean } = {})
     const lay = deck.layout(s.layout);
     const title = s.elements.find((e) => e.ph && (e.ph.type === 'title' || e.ph.type === 'ctrTitle')) as ShapeElement | undefined;
     const ttext = title?.text ? title.text.paras.map((p) => mdInline(p.runs)).join(' ').trim() : '';
-    if (ttext) lines.push(`${lay.type === 'title' || lay.type === 'secHead' || title?.ph?.type === 'ctrTitle' ? '#' : '##'} ${ttext}`, '');
+    // A title ending in #s would lose them as a closing sequence.
+    if (ttext) lines.push(`${lay.type === 'title' || lay.type === 'secHead' || title?.ph?.type === 'ctrTitle' ? '#' : '##'} ${ttext.replace(/(#+)$/, (h) => '\\' + h.split('').join('\\'))}`, '');
     for (const e of s.elements) {
       if (e === title) continue;
       if (e.kind === 'shape' && e.text && !(e.ph && ['dt', 'ftr', 'sldNum'].includes(e.ph.type))) {
@@ -199,7 +222,7 @@ export function exportMarkdown(deck: Deck, opts: { embedImages?: boolean } = {})
           const t = mdInline(p.runs).trim();
           if (!t) continue;
           const kind = p.bullet?.kind ?? (isList ? 'char' : 'none');
-          if (kind === 'none') { lines.push(t, ''); continue; }
+          if (kind === 'none') { lines.push(escapeLead(t), ''); continue; }
           counters[p.level] = kind === 'num' ? (counters[p.level] || 0) + 1 : 0;
           lines.push(`${'  '.repeat(p.level)}${kind === 'num' ? `${counters[p.level]}.` : '-'} ${t}`);
         }
@@ -215,7 +238,7 @@ export function exportMarkdown(deck: Deck, opts: { embedImages?: boolean } = {})
       }
     }
     const notes = s.notes.map((p) => p.runs.map((r) => (r.br ? '\n' : r.text)).join('')).join('\n').trim();
-    if (notes) lines.push('Note:', notes, '');
+    if (notes) lines.push('Note:', notes.split('\n').map((l) => l.replace(NOTE_NEEDS_ESCAPE, '$1\\').replace(/<!--/g, '<\\!--')).join('\n'), '');
     out.push(lines.join('\n').trim() + '\n');
     if (i < deck.slides.length - 1) out.push('\n---\n\n');
   });

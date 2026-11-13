@@ -59,7 +59,7 @@ const registry = new Map<string, Command>();
 export function def(c: Command | Command[]): void {
   const list = Array.isArray(c) ? c : [c];
   for (const cmd of list) {
-    if (registry.has(cmd.id)) console.warn(`Duplicate command id ${cmd.id}`);
+    if (registry.has(cmd.id)) throw new Error(`Duplicate command id ${cmd.id}`);
     registry.set(cmd.id, cmd);
   }
 }
@@ -69,7 +69,8 @@ export function getCommand(id: string): Command | undefined {
   if (c) return c;
   if (id.startsWith('macro:')) {
     const name = id.slice(6);
-    return { id, label: name, icon: 'smart_button', tab: 'Macros', group: 'Macros', noRecord: true, run: (app) => app.exec('dev.runMacro', name) };
+    // Recorded as one step when a macro runs another; dev.runMacro stops runaway recursion.
+    return { id, label: name, icon: 'smart_button', tab: 'Macros', group: 'Macros', edits: false, run: (app) => app.exec('dev.runMacro', name) };
   }
   return undefined;
 }

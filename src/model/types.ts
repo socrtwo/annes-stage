@@ -264,6 +264,8 @@ export type TransitionType =
 export interface Transition {
   type: TransitionType;
   dir?: 'l' | 'r' | 'u' | 'd' | 'in' | 'out' | 'horz' | 'vert' | 'lu' | 'ru' | 'ld' | 'rd';
+  /** Split transitions: whether the halves move in or out (dir then holds horz/vert). */
+  inOut?: 'in' | 'out';
   /** Duration in ms. */
   dur?: number;
   /** Advance on click (default true). */

@@ -3,8 +3,10 @@
  *
  * Settings (which provider is active, models, options) live in localStorage. API keys never do:
  * on Android they are encrypted with a key held in the Android Keystore (QuillNative
- * secureSet/secureGet); in a browser they go to IndexedDB under a separate key, so settings
- * export, drafts and documents never contain them.
+ * secureSet/secureGet) and in the desktop app with the system keychain (safeStorage). When the
+ * desktop has no keychain, the key is kept for this session only unless the user agrees to store
+ * it unencrypted. In a browser keys go to IndexedDB under a separate key, so settings export,
+ * drafts and documents never contain them; browser storage is not encrypted.
  */
 import { kvGet, kvSet, kvDel } from '../util/store';
 import { isNative, secureGet, secureSet, secureRemove } from '../platform/native';
@@ -64,7 +66,21 @@ export function defaultAiSettings(): AiSettings {
 }
 
 let cache: AiSettings | null = null;
+/** The last save could not be written (storage full or blocked): the in-memory settings are newer than storage. */
+let unsaved = false;
 const listeners = new Set<() => void>();
+
+/** One channel for sending and receiving: a channel does not receive its own messages, so a save here does not reload here. */
+let channel: BroadcastChannel | null = null;
+if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
+  try {
+    channel = new BroadcastChannel('quillstage-ai');
+    // Settings changed in another tab (e.g. the OAuth callback tab): reload.
+    channel.onmessage = () => reloadAiSettings();
+    // Unref'd so tooling that imports this module under Node can exit.
+    (channel as unknown as { unref?: () => void }).unref?.();
+  } catch { channel = null; }
+}
 
 export function aiSettings(): AiSettings {
   if (cache) return cache;
@@ -84,8 +100,8 @@ export function aiSettings(): AiSettings {
 export function saveAiSettings(mut?: (s: AiSettings) => void): void {
   const s = aiSettings();
   mut?.(s);
-  try { localStorage.setItem(KEY, JSON.stringify(s)); } catch { /* quota */ }
-  try { new BroadcastChannel('quillstage-ai').postMessage({ type: 'settings' }); } catch { /* unsupported */ }
+  try { localStorage.setItem(KEY, JSON.stringify(s)); unsaved = false; } catch { unsaved = true; /* quota: keep the change in memory */ }
+  if (!unsaved) { try { channel?.postMessage({ type: 'settings' }); } catch { /* closed */ } }
   listeners.forEach((f) => f());
 }
 
@@ -94,20 +110,21 @@ export function onAiSettingsChange(f: () => void): () => void {
   return () => listeners.delete(f);
 }
 
-/** Reload after another window (the OAuth callback tab) changed settings. */
+/**
+ * Reload after another window (the OAuth callback tab) changed settings. Changes this window could
+ * not write to storage are kept: they are written again on top of what the other window saved.
+ */
 export function reloadAiSettings(): void {
+  if (unsaved && cache) {
+    const mine = cache;
+    cache = null;
+    const theirs = aiSettings();
+    cache = { ...theirs, ...mine, providers: { ...theirs.providers, ...mine.providers } };
+    saveAiSettings();
+    return;
+  }
   cache = null;
   listeners.forEach((f) => f());
-}
-
-// Settings changed in another tab (e.g. the OAuth callback tab): reload. Browser only, and unref'd so
-// tooling that imports this module under Node can exit.
-if (typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined') {
-  try {
-    const bc = new BroadcastChannel('quillstage-ai');
-    bc.onmessage = () => reloadAiSettings();
-    (bc as unknown as { unref?: () => void }).unref?.();
-  } catch { /* unsupported */ }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -125,10 +142,19 @@ export async function getApiKey(providerId: string): Promise<string> {
   return k;
 }
 
-export async function setApiKey(providerId: string, key: string): Promise<void> {
+/**
+ * Where a key was put: 'secure' (encrypted by the system), 'plain' (the desktop app without a
+ * keychain, stored unencrypted because the caller passed allowPlain), 'session' (not stored: the
+ * system cannot encrypt it; it is kept until the app closes) or 'browser' (IndexedDB, unencrypted).
+ */
+export type KeyStorage = 'secure' | 'plain' | 'session' | 'browser';
+
+export async function setApiKey(providerId: string, key: string, opts: { allowPlain?: boolean } = {}): Promise<KeyStorage> {
   keyCache.set(providerId, key);
-  if (isNative()) await secureSet('ai.key.' + providerId, key);
-  else await kvSet('aikey:' + providerId, key);
+  if (!isNative()) { await kvSet('aikey:' + providerId, key); return 'browser'; }
+  const r = await secureSet('ai.key.' + providerId, key, opts);
+  if (!r.stored) return 'session';
+  return r.plaintext ? 'plain' : 'secure';
 }
 
 export async function deleteApiKey(providerId: string): Promise<void> {

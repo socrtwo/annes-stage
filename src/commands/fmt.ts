@@ -227,8 +227,8 @@ def([
       setBullet(app, bullet, 'Bullets and Numbering');
     },
   },
-  { id: 'fmt.indent', label: 'Increase List Level', icon: 'format_indent_increase', tab: 'Home', group: 'Paragraph', keys: ['Alt-Shift-ArrowRight'], edits: true, run: (app) => applyPara(app, (p) => ({ level: Math.min(8, p.level + 1), ...(p.marL != null ? { marL: p.marL + 36 } : {}) }), 'Increase List Level') },
-  { id: 'fmt.outdent', label: 'Decrease List Level', icon: 'format_indent_decrease', tab: 'Home', group: 'Paragraph', keys: ['Alt-Shift-ArrowLeft'], edits: true, run: (app) => applyPara(app, (p) => ({ level: Math.max(0, p.level - 1), ...(p.marL != null ? { marL: Math.max(0, p.marL - 36) } : {}) }), 'Decrease List Level') },
+  { id: 'fmt.indent', label: 'Increase List Level', icon: 'format_indent_increase', tab: 'Home', group: 'Paragraph', keys: ['Alt-Shift-ArrowRight'], edits: true, tip: 'In Outline view, demotes the slide or paragraph', run: (app, arg) => app.tab.view === 'outline' && !app.tab.ui.editingText && arg !== 'para' ? app.exec('outline.demote') : applyPara(app, (p) => ({ level: Math.min(8, p.level + 1), ...(p.marL != null ? { marL: p.marL + 36 } : {}) }), 'Increase List Level') },
+  { id: 'fmt.outdent', label: 'Decrease List Level', icon: 'format_indent_decrease', tab: 'Home', group: 'Paragraph', keys: ['Alt-Shift-ArrowLeft'], edits: true, tip: 'In Outline view, promotes the slide or paragraph', run: (app, arg) => app.tab.view === 'outline' && !app.tab.ui.editingText && arg !== 'para' ? app.exec('outline.promote') : applyPara(app, (p) => ({ level: Math.max(0, p.level - 1), ...(p.marL != null ? { marL: Math.max(0, p.marL - 36) } : {}) }), 'Decrease List Level') },
   {
     id: 'fmt.lineSpacing', label: 'Line Spacing', icon: 'format_line_spacing', tab: 'Home', group: 'Paragraph', kind: 'menu', edits: true,
     menu: () => [...[1, 1.15, 1.5, 2, 2.5, 3].map((x) => ({ id: 'fmt.lineSpacing', arg: x * 100, label: String(x) })), { separator: true }, { id: 'fmt.paragraphDialog', label: 'Line Spacing Options…' }],

@@ -459,10 +459,10 @@ This file is generated from the source by `npm run catalog`; a unit test fails w
 | Last Slide | Navigation | Ctrl+End | `slide.last` | not in tabs |
 | Next Slide | Navigation | PageDown | `slide.next` | not in tabs |
 | Previous Slide | Navigation | PageUp | `slide.prev` | not in tabs |
-| Demote | Outline | Alt+Shift+ArrowRight | `outline.demote` | not in tabs |
+| Demote | Outline |  | `outline.demote` | not in tabs |
 | Move Down | Outline | Alt+Shift+ArrowDown | `outline.moveDown` | not in tabs |
 | Move Up | Outline | Alt+Shift+ArrowUp | `outline.moveUp` | not in tabs |
-| Promote | Outline | Alt+Shift+ArrowLeft | `outline.promote` | not in tabs |
+| Promote | Outline |  | `outline.promote` | not in tabs |
 | Navigator | Panes |  | `view.navigator` | inspired by Impress Navigator |
 | Normal | Presentation Views |  | `view.normal` |  |
 | Notes Page | Presentation Views |  | `view.notesPage` |  |
@@ -486,7 +486,7 @@ This file is generated from the source by `npm run catalog`; a unit test fails w
 | New Window | Window |  | `view.newWindow` |  |
 | Switch Windows | Window | Ctrl+F6 | `view.switchWindow` | has options menu |
 | Fit to Window | Zoom |  | `view.fit` |  |
-| Zoom In | Zoom | Ctrl+= | `view.zoomIn` |  |
+| Zoom In | Zoom | Ctrl+Alt+= | `view.zoomIn` |  |
 | Zoom Out | Zoom | Ctrl+- | `view.zoomOut` |  |
 | Zoom… | Zoom |  | `view.zoom` |  |
 

@@ -5,6 +5,7 @@ import type { Element, Layout, Master, PlaceholderType, ShapeElement } from '../
 import { clone, defaultLayouts, defaultMaster, newId } from '../model/deck';
 import { openDialog, toast, promptDialog } from '../ui/dialog';
 import { isLayout, isMaster } from '../model/inherit';
+import { esc } from '../ui/dom';
 
 const inMaster = (app: App) => app.tab?.view === 'master';
 const target = (app: App): Layout | Master | undefined => (inMaster(app) ? (app.owner as Layout | Master | undefined) : undefined);
@@ -89,7 +90,7 @@ def([
       const users = d.slides.filter((s) => s.layout === l.id);
       let to = (siblings.find((x) => x.type === l.type) || siblings.find((x) => x.type === 'obj') || siblings[0]).id;
       if (users.length) {
-        const r = await openDialog({ title: 'Delete Layout', fields: [{ key: 'i', type: 'info', html: `<p>${users.length} slide(s) use "${l.name}". Move them to:</p>` }, { key: 'to', label: 'Layout', type: 'select', options: siblings.map((x) => ({ value: x.id, label: x.name })), value: to }] });
+        const r = await openDialog({ title: 'Delete Layout', fields: [{ key: 'i', type: 'info', html: `<p>${users.length} slide(s) use "${esc(l.name || '')}". Move them to:</p>` }, { key: 'to', label: 'Layout', type: 'select', options: siblings.map((x) => ({ value: x.id, label: x.name })), value: to }] });
         if (!r) return;
         to = r.to;
       }

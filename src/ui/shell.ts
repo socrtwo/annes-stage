@@ -445,9 +445,20 @@ export class Shell {
     const tab = this.app.tab;
     const r = await openDialog({ title: 'Presentation', fields: [{ key: 'name', label: 'File name', type: 'text', value: tab.fileName || tab.title }, { key: 'title', label: 'Title property', type: 'text', value: this.app.deck.data.props.title || '' }] });
     if (!r) return;
-    tab.fileName = r.name; tab.title = r.name.replace(/\.[^.]+$/, '');
-    this.app.deck.data.props.title = r.title;
+    const deck = this.app.deck;
+    const name = String(r.name || '').trim() || tab.fileName || tab.title;
+    if (name !== (tab.fileName || tab.title)) {
+      tab.fileName = name; tab.title = name.replace(/\.[^.]+$/, '');
+      // The new name is kept by the next save and the next draft.
+      tab.dirty = true;
+      this.app.scheduleAutosave();
+    }
+    if ((r.title || '') !== (deck.data.props.title || '')) {
+      if (this.app.isReadOnly()) toast('This presentation is read-only: its title property was not changed.');
+      else deck.transact('Title', () => { deck.data.props.title = r.title; });
+    }
     this.tabsChanged();
+    document.title = `${tab.displayName}${tab.dirty ? ' •' : ''} – Anne\'s Stage`;
   }
 
   moreMenu(anchor: HTMLElement): void {
@@ -533,7 +544,10 @@ export class Shell {
     document.body.appendChild(overlay);
     let results: Command[] = [];
     let sel = 0;
-    const close = () => { overlay.remove(); app.focus(); };
+    // Escape closes the palette wherever focus is (a pin button, the list, the page).
+    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape' && overlay.isConnected && !document.querySelector('.ql-menu')) { e.preventDefault(); e.stopPropagation(); close(); } };
+    const close = () => { document.removeEventListener('keydown', onEsc, true); overlay.remove(); app.focus(); };
+    document.addEventListener('keydown', onEsc, true);
     const run = (c: Command) => { close(); if (c.kind === 'menu' && c.menu) this.openCommandMenu(c, this.anchorFor(c.id)); else app.exec(c.id); };
     const draw = () => {
       clear(list);
@@ -555,7 +569,6 @@ export class Shell {
       if (e.key === 'ArrowDown') { sel = Math.min(results.length - 1, sel + 1); draw(); list.children[sel]?.scrollIntoView({ block: 'nearest' }); e.preventDefault(); }
       if (e.key === 'ArrowUp') { sel = Math.max(0, sel - 1); draw(); list.children[sel]?.scrollIntoView({ block: 'nearest' }); e.preventDefault(); }
       if (e.key === 'Enter' && results[sel]) { e.preventDefault(); run(results[sel]); }
-      if (e.key === 'Escape') close();
     });
     overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
     draw();
@@ -651,7 +664,12 @@ export class Shell {
       if (document.querySelector('.ql-menu')) { closeMenus(); return; }
       if (this.root.classList.contains('ql-backstage-open')) { this.hideBackstage(); return; }
     }
-    if (document.querySelector('.ql-overlay')) return;
+    if (document.querySelector('.ql-overlay')) {
+      // A dialog is open: its fields get the keys, but Save, Print and Open must not reach the browser.
+      const over = this.app.keyIndex.get(canonicalKey(k));
+      if ((e.ctrlKey || e.metaKey) && ((over && /^file\.(save|print|open|quickPrint|saveAs)$/.test(over)) || /^[spo]$/i.test(e.key))) e.preventDefault();
+      return;
+    }
     const t = e.target as HTMLElement;
     const inField = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT');
     const inCanvas = this.app.active && this.app.tab.ui.el.contains(t) && !inField;

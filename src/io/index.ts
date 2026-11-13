@@ -38,6 +38,26 @@ export class PasswordNeeded extends Error {
   constructor(message = 'This presentation is encrypted; enter its password to open it.') { super(message); this.name = 'PasswordNeeded'; }
 }
 
+/**
+ * Decodes a text file: a UTF-8, UTF-16LE or UTF-16BE byte-order mark is honoured (and dropped);
+ * without one, BOM-less UTF-16 is recognised by its zero bytes, and anything that is not valid
+ * UTF-8 is read as Windows-1252.
+ */
+export function decodeText(u8: Uint8Array): string {
+  if (u8[0] === 0xef && u8[1] === 0xbb && u8[2] === 0xbf) return new TextDecoder('utf-8').decode(u8.subarray(3));
+  if (u8[0] === 0xff && u8[1] === 0xfe) return new TextDecoder('utf-16le').decode(u8.subarray(2));
+  if (u8[0] === 0xfe && u8[1] === 0xff) return new TextDecoder('utf-16be').decode(u8.subarray(2));
+  if (u8.length >= 4) {
+    // Heuristic for BOM-less UTF-16: ASCII text has a zero in every other byte.
+    let even = 0, odd = 0;
+    const n = Math.min(u8.length & ~1, 1024);
+    for (let i = 0; i < n; i += 2) { if (u8[i] === 0) even++; if (u8[i + 1] === 0) odd++; }
+    if (odd > n / 2 * 0.6 && even === 0) return new TextDecoder('utf-16le').decode(u8);
+    if (even > n / 2 * 0.6 && odd === 0) return new TextDecoder('utf-16be').decode(u8);
+  }
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(u8); } catch { return new TextDecoder('windows-1252').decode(u8); }
+}
+
 const ascii = (u8: Uint8Array, from: number, to: number) => { let s = ''; for (let i = from; i < Math.min(u8.length, to); i++) s += String.fromCharCode(u8[i]); return s; };
 const contains = (u8: Uint8Array, s: string, limit = u8.length) => {
   const n = s.length;
@@ -68,7 +88,7 @@ export function sniffFormat(data: Uint8Array, name: string): string | null {
   }
   if (data[0] === 0xd0 && data[1] === 0xcf && data[2] === 0x11 && data[3] === 0xe0) return 'ppt';
   if (head.startsWith('{\\rtf')) return 'rtf';
-  const text = new TextDecoder().decode(data.subarray(0, 4096)).replace(/^﻿/, '');
+  const text = decodeText(data.subarray(0, 4096)).replace(/^\uFEFF/, '');
   if (/^\s*</.test(text) && /office:document/.test(text)) return 'fodp';
   if (/^\s*\{/.test(text) && /"format"\s*:\s*"quillstage"/.test(text)) return 'json';
   if (byName === 'md' || byName === 'txt') return byName;
@@ -95,11 +115,11 @@ async function importNormal(data: Uint8Array, fmt: string, opts: { password?: st
     }
     case 'md': {
       const { importMarkdown } = await import('./markdown');
-      return { deck: importMarkdown(new TextDecoder().decode(data)), warnings: [] };
+      return { deck: importMarkdown(decodeText(data)), warnings: [] };
     }
     case 'txt': {
       const { importTextOutline } = await import('./outline');
-      return { deck: importTextOutline(new TextDecoder().decode(data)), warnings: [] };
+      return { deck: importTextOutline(decodeText(data)), warnings: [] };
     }
     case 'docx': {
       const { importDocxOutline } = await import('./outline');
@@ -157,7 +177,7 @@ export async function importDeck(data: Uint8Array, name: string, opts: { repair?
   throw error instanceof Error ? error : new Error(report.summary || 'This file could not be opened.');
 }
 
-export async function exportDeck(deck: Deck, format: string, opts: { password?: string } = {}): Promise<{ data: Uint8Array; mime: string; ext: string }> {
+export async function exportDeck(deck: Deck, format: string, opts: { password?: string } = {}): Promise<{ data: Uint8Array; mime: string; ext: string; /** Content the format could not carry. */ warnings?: string[] }> {
   const def = formatById(format);
   if (!def || !def.canExport) throw new Error(`Anne\'s Stage cannot save as ${format}.`);
   const out = (data: Uint8Array) => ({ data, mime: def.mime, ext: def.ext[0] });
@@ -169,7 +189,9 @@ export async function exportDeck(deck: Deck, format: string, opts: { password?: 
     }
     case 'odp': case 'otp': case 'fodp': {
       const { exportOdp } = await import('./odp');
-      return out(await exportOdp(deck, { flat: format === 'fodp', template: format === 'otp' }));
+      const warnings: string[] = [];
+      const data = await exportOdp(deck, { flat: format === 'fodp', template: format === 'otp', warnings });
+      return warnings.length ? { ...out(data), warnings } : out(data);
     }
     case 'md': {
       const { exportMarkdown } = await import('./markdown');

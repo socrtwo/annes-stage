@@ -2,18 +2,21 @@
 # Build the Anne's Stage Android APK on an Android device with Termux (https://termux.dev, the
 # F-Droid or GitHub build; the Play Store build is outdated).
 #
-#   curl -fsSLO https://raw.githubusercontent.com/socrtwo/QuillStage/main/scripts/termux-build.sh
+#   curl -fsSLO https://raw.githubusercontent.com/socrtwo/annes-stage/main/scripts/termux-build.sh
 #   bash termux-build.sh            # first run installs everything (about 2.5 GB, 20-40 minutes)
 #   bash termux-build.sh --web      # only the web build (dist/), no Android SDK needed
 #
-# Environment overrides: QL_DIR (checkout, default ~/QuillStage), QL_BRANCH (default main),
+# Environment overrides: QL_DIR (checkout, default ~/annes-stage, or ~/QuillStage when an earlier
+# run of this script cloned there), QL_BRANCH (default main),
 # ANDROID_HOME (default ~/android-sdk), QL_HEAP (Gradle heap, default 1536m).
 #
 # Google's Android SDK has no ARM build of aapt2, so the build uses Termux's own aapt2 via
 # android.aapt2FromMavenOverride. Needs a 64-bit ARM device with about 4 GB of RAM.
 set -euo pipefail
 
-QL_DIR="${QL_DIR:-$HOME/QuillStage}"
+# Earlier versions of this script cloned into ~/QuillStage: keep using that checkout if it exists.
+if [[ -z "${QL_DIR:-}" && -d "$HOME/QuillStage/.git" ]]; then QL_DIR="$HOME/QuillStage"; fi
+QL_DIR="${QL_DIR:-$HOME/annes-stage}"
 QL_BRANCH="${QL_BRANCH:-main}"
 ANDROID_HOME="${ANDROID_HOME:-$HOME/android-sdk}"
 QL_HEAP="${QL_HEAP:-1536m}"
@@ -35,7 +38,7 @@ if [[ -d "$QL_DIR/.git" ]]; then
   git -C "$QL_DIR" fetch --depth 1 origin "$QL_BRANCH"
   git -C "$QL_DIR" checkout -q FETCH_HEAD
 else
-  git clone --depth 1 --branch "$QL_BRANCH" https://github.com/socrtwo/QuillStage "$QL_DIR"
+  git clone --depth 1 --branch "$QL_BRANCH" https://github.com/socrtwo/annes-stage "$QL_DIR"
 fi
 cd "$QL_DIR"
 

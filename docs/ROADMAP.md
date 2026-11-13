@@ -1,6 +1,6 @@
 # Roadmap
 
-> **Status (0.1.0):** M1 is done; parts of M2–M5 are done as noted below, and [COMMANDS.md](COMMANDS.md) lists every planned command not yet implemented. Milestones are ordered by dependency, not by date. Each milestone ends with a tagged prerelease built for every platform by the release workflow, starting with M1. Command ids refer to [COMMANDS-PLAN.md](COMMANDS-PLAN.md).
+> **Status (0.2.0):** M1 is done; parts of M2–M5 are done as noted below, and [COMMANDS.md](COMMANDS.md) lists every planned command not yet implemented. Milestones are ordered by dependency, not by date. Each milestone ends with a tagged prerelease built for every platform by the release workflow, starting with M1. Command ids refer to [COMMANDS-PLAN.md](COMMANDS-PLAN.md).
 
 ## M0 — Planning (this repository)
 

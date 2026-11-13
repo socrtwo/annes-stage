@@ -23,10 +23,24 @@ export interface PngOptions {
 
 const fontCache = new Map<string, string>();
 
+/** Largest canvas side and area browsers reliably allocate (Chrome/Firefox: 32767 px side, ~268 M px area; Safari is smaller). */
+export const MAX_CANVAS_SIDE = 16384;
+export const MAX_CANVAS_AREA = 268_435_456;
+
+/** Clamps a requested picture size to what a canvas can hold, keeping the aspect ratio. */
+export function clampCanvas(width: number, height: number): { width: number; height: number } {
+  let w = Math.max(1, Math.round(Number.isFinite(width) ? width : 1)), h = Math.max(1, Math.round(Number.isFinite(height) ? height : 1));
+  let k = Math.min(1, MAX_CANVAS_SIDE / w, MAX_CANVAS_SIDE / h);
+  if (w * h * k * k > MAX_CANVAS_AREA) k = Math.min(k, Math.sqrt(MAX_CANVAS_AREA / (w * h)));
+  if (k < 1) { w = Math.max(1, Math.floor(w * k)); h = Math.max(1, Math.floor(h * k)); }
+  return { width: w, height: h };
+}
+
 async function dataUrl(url: string): Promise<string> {
   const hit = fontCache.get(url);
   if (hit) return hit;
   const res = await fetch(url);
+  if (!res.ok) throw new Error(`Font ${url} could not be loaded (${res.status}).`);
   const buf = new Uint8Array(await res.arrayBuffer());
   const s = `data:font/woff2;base64,${toBase64(buf)}`;
   fontCache.set(url, s);
@@ -63,8 +77,7 @@ export async function standaloneSvg(deck: Deck, slide: Slide, step?: number): Pr
 
 export async function slidePng(deck: Deck, slide: Slide, opts: PngOptions): Promise<Blob> {
   const { w, h } = deck.size;
-  const width = Math.max(16, Math.round(opts.width));
-  const height = Math.round((width * h) / w);
+  const { width, height } = clampCanvas(Math.max(16, Math.round(opts.width) || 16), (Math.max(16, Math.round(opts.width) || 16) * h) / w);
   const markup = (await standaloneSvg(deck, slide, opts.step)).replace(/width="[^"]*" height="[^"]*"/, `width="${width}" height="${height}"`);
   const url = URL.createObjectURL(new Blob([markup], { type: 'image/svg+xml' }));
   try {

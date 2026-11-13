@@ -8,6 +8,7 @@ import JSZip from 'jszip';
 import { Deck } from '../model/deck';
 import { encryptJson, decryptJson } from '../util/crypto';
 import { b64, dec, enc, unb64 } from './xml';
+import { inflateCapped, ZipBudget } from './zip';
 
 export const QSP_MIME = 'application/x-quillstage';
 
@@ -28,11 +29,13 @@ export async function importQsp(data: Uint8Array): Promise<Deck> {
   const zip = await JSZip.loadAsync(data);
   const f = zip.file('deck.json');
   if (!f) throw new Error('This Anne\'s Stage package has no deck.json.');
-  const j = JSON.parse(await f.async('string'));
+  // Entries are inflated on demand within size caps (see ./zip).
+  const budget = new ZipBudget();
+  const j = JSON.parse(dec(await inflateCapped(f, budget)).replace(/^\uFEFF/, ''));
   const media: Record<string, any> = {};
   for (const [id, info] of Object.entries<any>(j.mediaIndex || {})) {
     const mf = zip.file(`media/${id}`);
-    if (mf) media[id] = { mime: info.mime, b64: b64(await mf.async('uint8array')), ...(info.name ? { name: info.name } : {}) };
+    if (mf) media[id] = { mime: info.mime, b64: b64(await inflateCapped(mf, budget)), ...(info.name ? { name: info.name } : {}) };
   }
   return Deck.fromJSON({ format: 'quillstage', version: j.version || 1, data: j.data, media: { ...(j.media || {}), ...media } });
 }

@@ -1,6 +1,6 @@
 # Installing Anne's Stage
 
-Every release on the [Releases](https://github.com/socrtwo/QuillStage/releases) page has a build for each platform, plus `SHA256SUMS.txt` to check the downloads. The builds are not signed with paid store certificates, so each system asks once whether to trust them. The steps are below.
+Every release on the [Releases](https://github.com/socrtwo/annes-stage/releases) page has a build for each platform, plus `SHA256SUMS.txt` to check the downloads. The builds are not signed with paid store certificates, so each system asks once whether to trust them. The steps are below.
 
 | Platform | File | Notes |
 |---|---|---|

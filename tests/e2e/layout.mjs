@@ -142,16 +142,19 @@ function cleanupScript() {
   try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); } catch { /* */ }
   document.querySelectorAll('.ql-overlay, .ql-menu, .ql-toast').forEach((e) => e.remove());
   try { app.ui.hideBackstage(); app.ui.closePane(); } catch { /* */ }
-  document.body.classList.remove('ql-zen');
+  document.body.classList.remove('ql-fullscreen');
+  try { if (document.fullscreenElement) void document.exitFullscreen().catch(() => {}); } catch { /* */ }
   document.querySelector('.ql-ai-busy')?.remove();
   window.scrollTo(0, 0); document.scrollingElement.scrollLeft = 0;
 }
 
+/** Uncaught errors in the page, per scenario: each one fails the run. */
+const pageErrors = [];
 async function newPage(sc, query = '') {
   const ctx = await browser.newContext({ viewport: sc.viewport, deviceScaleFactor: 1, isMobile: !sc.desktop, hasTouch: !sc.desktop });
   const page = await ctx.newPage();
   const errors = [];
-  page.on('pageerror', (e) => errors.push(e.message));
+  page.on('pageerror', (e) => { errors.push(e.message); pageErrors.push({ sc: sc.name, msg: String(e.message || e).split('\n')[0] }); });
   await page.addInitScript((I) => {
     localStorage.setItem('quillstage.prefs.v1', JSON.stringify({ firstRun: false }));
     window.print = () => {}; window.open = () => null;
@@ -167,7 +170,7 @@ async function newPage(sc, query = '') {
     document.addEventListener('DOMContentLoaded', setInsets);
   }, sc.insets);
   await page.goto(URL + query);
-  await page.waitForFunction(() => window.qs && document.querySelector('.ql-titlebar'), null, { timeout: 60000 });
+  await page.waitForFunction(() => window.qs && window.__qsGetCommand && document.querySelector('.ql-titlebar'), null, { timeout: 60000 });
   // Icons are a ligature font: until it loads they render as their (wide) names and skew every measurement.
   await page.evaluate(async () => { try { await document.fonts.ready; await document.fonts.load('24px "Material Symbols Outlined"', 'home'); } catch { /* measured anyway */ } }).catch(() => {});
   await page.waitForTimeout(500);
@@ -187,7 +190,7 @@ for (const sc of SCENARIOS) {
   const steps = [['(app frame)', () => undefined], ['(file screen)', () => window.qs.ui.showBackstage()], ['(qat menu)', () => window.qs.ui.qatMenu(document.querySelector('.ql-qat-customize'))], ['(more menu)', () => window.qs.ui.moreMenu(document.querySelector('.ql-titlebar .ql-iconbtn[aria-label=More]'))], ['(command search)', () => window.qs.ui.commandPalette()],
     ['(two documents)', () => window.qs.exec('file.new')],
     ['(qat at bottom)', () => { const a = window.qs; a.prefs.qatPosition = 'bottom'; a.ui.applyPrefs(); }],
-    ['(distraction-free)', () => { const a = window.qs; a.prefs.qatPosition = 'top'; a.ui.applyPrefs(); a.exec('view.distractionFree'); }]];
+    ['(full screen)', () => { const a = window.qs; a.prefs.qatPosition = 'top'; a.ui.applyPrefs(); if (!window.__qsGetCommand('view.fullScreen')) throw new Error('view.fullScreen is not a command'); a.exec('view.fullScreen'); }]];
   for (const [label, fn] of steps) {
     await page.evaluate(fn);
     await page.waitForTimeout(250);
@@ -225,6 +228,7 @@ for (const sc of SCENARIOS) {
     await page.evaluate(cleanupScript).catch(() => {});
   }
   await ctx.close();
+  for (const e of pageErrors.filter((x) => x.sc === sc.name)) defects.push(`pageerror: ${e.msg}`);
   if (!menuIds) menuIds = showing; // later scenarios only re-open commands that show something
   const failing = new Set(defects.map((d) => d.split(': ')[0]));
   report[sc.name] = { checked: ids.length, showing: showing.length, failing: failing.size, defects };

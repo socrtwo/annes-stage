@@ -71,7 +71,7 @@ You can build the APK on a 64-bit ARM phone or tablet with 4 GB of RAM or more, 
 ```bash
 pkg install -y curl
 termux-setup-storage        # optional: lets the script copy the APK to Downloads
-curl -fsSLO https://raw.githubusercontent.com/socrtwo/QuillStage/main/scripts/termux-build.sh
+curl -fsSLO https://raw.githubusercontent.com/socrtwo/annes-stage/main/scripts/termux-build.sh
 bash termux-build.sh
 ```
 
@@ -80,7 +80,7 @@ Options (environment variables):
 | Variable | Default | Meaning |
 |---|---|---|
 | `QL_BRANCH` | `main` | Branch to build |
-| `QL_DIR` | `~/QuillStage` | Checkout folder |
+| `QL_DIR` | `~/annes-stage` (`~/QuillStage` if an earlier run cloned there) | Checkout folder |
 | `ANDROID_HOME` | `~/android-sdk` | SDK folder |
 | `QL_HEAP` | `1536m` | Gradle heap; lower it (`1024m`) if the build is killed for memory |
 
@@ -90,12 +90,12 @@ The manual steps the script performs, if you prefer to run them yourself:
 
 ```bash
 pkg update -y && pkg install -y git nodejs-lts openjdk-21 aapt aapt2 unzip wget zip
-git clone --depth 1 https://github.com/socrtwo/QuillStage && cd Anne's Stage
+git clone --depth 1 https://github.com/socrtwo/annes-stage ~/annes-stage && cd ~/annes-stage
 ELECTRON_SKIP_BINARY_DOWNLOAD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci
 npm run build
 mkdir -p ~/android-sdk/cmdline-tools && cd ~/android-sdk/cmdline-tools
 wget https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip
-unzip commandlinetools-linux-*_latest.zip && mv cmdline-tools latest && cd ~/QuillStage
+unzip commandlinetools-linux-*_latest.zip && mv cmdline-tools latest && cd ~/annes-stage
 export ANDROID_HOME=~/android-sdk JAVA_HOME=$PREFIX/lib/jvm/java-21-openjdk
 yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
 $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-36" "build-tools;36.0.0"

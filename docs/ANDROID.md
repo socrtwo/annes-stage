@@ -58,14 +58,14 @@ and git-ignored.
 Publishing:
 
 - **Tagged release:** bump `version` in `package.json`, commit, then
-  `git tag v0.1.0 && git push origin v0.1.0`. The Release workflow builds every platform and publishes
+  `git tag v0.2.0 && git push origin v0.2.0`. The Release workflow builds every platform and publishes
   one GitHub Release named after the tag, with the APK, AAB and `SHA256SUMS.txt` among its files (tags
   containing `-`, e.g. `v0.2.0-beta.1`, are marked prerelease). A commit whose message contains
   `[release]` does the same without a tag, as a prerelease. The Android build warns if the tag does not
   match `package.json`.
 - **Prerelease from any branch, without tagging:** Actions -> *Android* -> *Run workflow*, choose the
   branch, tick **prerelease**. This publishes a GitHub prerelease called
-  `Anne's Stage <version> (build <run number>)` under the tag `v<version>-build.<run number>` pointing at
+  `Anne's Stage <version> (Android build <run number>)` under the tag `v<version>-android-build.<run number>` pointing at
   that commit.
 
 ## Signing

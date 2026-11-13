@@ -13,7 +13,7 @@ import { h, icon, clear } from './dom';
 import { openDialog, toast, confirmDialog } from './dialog';
 import type { App } from '../app';
 import { PROVIDERS, providerById, detectKey, FREE_LABEL, type ProviderDef } from '../ai/providers';
-import { aiSettings, saveAiSettings, getApiKey, setApiKey, deleteApiKey, maskKey, resolveBaseUrl, type ProviderConfig } from '../ai/store';
+import { aiSettings, saveAiSettings, getApiKey, setApiKey, deleteApiKey, maskKey, resolveBaseUrl, type ProviderConfig, type KeyStorage } from '../ai/store';
 import { listModels, pickModels, chat, AiError } from '../ai/client';
 import { costNote, normalizeEnsemble, MAX_MEMBERS, type EnsembleMode, type EnsembleSettings } from '../ai/ensemble';
 import { openExternal, readClipboardText, writeClipboardText, onAppResume, isNative, isCapacitor } from '../platform/native';
@@ -26,6 +26,25 @@ const SECTIONS: { title: string; help: string; ids: string[] }[] = [
 ];
 
 const host = (u: string) => { try { return new URL(u).host; } catch { return u; } };
+
+/** Shown wherever a key is entered in a browser (not the apps): browser storage is not encrypted. */
+export const WEB_KEY_NOTICE = 'In a web browser, API keys are stored unencrypted in this browser\'s storage (IndexedDB) for this site. Anyone with access to this browser profile can read them. For encrypted storage, use the Android or desktop app; on a shared computer, remove the key when you are done (AI ▸ Providers & Models).';
+
+/**
+ * Saves a key and, when the desktop has no system keychain to encrypt it with, asks whether to store
+ * it unencrypted or keep it only until the app closes.
+ */
+export async function saveKeyWithWarning(providerId: string, key: string): Promise<KeyStorage> {
+  const where = await setApiKey(providerId, key);
+  if (where !== 'session') return where;
+  const plain = await confirmDialog('No Secure Storage for the Key',
+    'This computer has no system keychain that Anne\'s Stage can use to encrypt the API key (on Linux: no GNOME Keyring, KWallet or other secret service is running).\nStore the key unencrypted in Anne\'s Stage\'s settings folder anyway, or keep it only until Anne\'s Stage closes?',
+    'Store Unencrypted', 'Only This Session');
+  if (!plain) { toast('The key is kept only until Anne\'s Stage closes.', { ms: 6000 }); return 'session'; }
+  const again = await setApiKey(providerId, key, { allowPlain: true });
+  if (again === 'plain') toast('The key is stored unencrypted on this computer.', { ms: 6000 });
+  return again;
+}
 
 /** Open the wizard. Resolves true when a provider was configured. */
 export async function openAiSetup(app: App, opts: { provider?: string; reason?: string } = {}): Promise<boolean> {
@@ -112,6 +131,7 @@ export async function openAiSetup(app: App, opts: { provider?: string; reason?: 
     if (p.needsKey || p.id === 'custom' || p.id === 'lmstudio' || p.id === 'ollama') {
       root.append(h('label', { class: 'ql-field' }, h('span', null, p.keyLabel || 'API key'), h('div', { class: 'ql-row' }, keyInput, showBtn, pasteBtn)));
       void getApiKey(p.id).then((k) => { if (k) { keyInput.placeholder = `Saved key ${maskKey(k)} (leave empty to keep)`; } });
+      if (!isNative()) root.append(h('p', { class: 'ql-help ql-ai-keynote' }, WEB_KEY_NOTICE));
     }
     const watch = h('input', { type: 'checkbox', checked: aiSettings().clipboardWatch, onchange: () => saveAiSettings((s) => { s.clipboardWatch = watch.checked; }) }) as HTMLInputElement;
     if (p.needsKey) root.append(h('label', { class: 'ql-check' }, watch, ' When I come back to Anne\'s Stage, look for the copied key in the clipboard'));
@@ -164,7 +184,7 @@ export async function openAiSetup(app: App, opts: { provider?: string; reason?: 
         if (!existing || !models.includes(cfg.model)) cfg.model = picked.quality;
         if (!existing || !cfg.fastModel || !models.includes(cfg.fastModel)) cfg.fastModel = picked.fast;
         cfg.verified = Date.now();
-        if (key) await setApiKey(p.id, key);
+        if (key) await saveKeyWithWarning(p.id, key);
         saveAiSettings((s) => { s.providers[p.id] = cfg; if (makeActive.checked || !s.active) s.active = p.id; });
         configured = true;
         if (fromClipboard && aiSettings().clearClipboard) {
@@ -420,6 +440,7 @@ function ensembleSection(app: App, draft: EnsembleSettings, preferMode?: Ensembl
     privacy.textContent = draft.mode === 'single'
       ? `Privacy: only the active provider (${name(to[0])}) receives the text an AI command sends.`
       : `Privacy: the text an AI command sends goes to every one of these services: ${to.map((id) => `${name(id)}${onDevice(id) ? ' (on this device)' : ''}`).join(', ')}.${cloud.length ? ' Each cloud service\'s terms and privacy policy apply.' : ''}`;
+    if (!isNative()) privacy.textContent += ' API keys are stored unencrypted in this browser\'s storage.';
   };
 
   root.append(
@@ -450,8 +471,8 @@ export async function openAiSettings(app: App, opts: { section?: 'ensemble'; mod
     },
     title: 'AI Settings', wide: true, fields: [
       { key: 'enabled', label: 'AI features are on', type: 'checkbox', value: s.enabled },
-      { key: 'confirmDocument', label: 'Ask before sending a large range (about 5,000 cells or more) to a cloud service', type: 'checkbox', value: s.confirmDocument },
-      { key: 'info', type: 'info', html: '<p class="ql-help">AI output that changes cells is always previewed first and applied as one step you can undo.</p>' },
+      { key: 'confirmDocument', label: 'Ask before sending a whole deck or long document (about 5,000 characters or more) to a cloud service', type: 'checkbox', value: s.confirmDocument },
+      { key: 'info', type: 'info', html: `<p class="ql-help">AI output that changes slides is always previewed first and applied as one step you can undo.</p>${isNative() ? '' : `<p class="ql-help">${WEB_KEY_NOTICE}</p>`}` },
       { key: 'language', label: 'Language for generated text', type: 'combo', options: ['auto', 'English', 'English (American)', 'English (British)', 'English (Canadian)', 'English (Australian)', 'English (Indian)', 'Spanish', 'French', 'German', 'Italian', 'Portuguese', 'Dutch', 'Chinese (Simplified)', 'Japanese', 'Korean'], value: s.language, half: true },
       { key: 'clipboardWatch', label: 'During setup, look for a copied API key when I return to the app', type: 'checkbox', value: s.clipboardWatch },
       { key: 'clearClipboard', label: 'Remove a recognized key from the clipboard after saving it', type: 'checkbox', value: s.clearClipboard },

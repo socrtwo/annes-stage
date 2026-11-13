@@ -35,6 +35,17 @@ export async function openDictionaryWizard(app: App): Promise<void> {
   const current = h('p', { class: 'ql-dict-current' });
   const list = h('div', { class: 'ql-dict-list', role: 'list' });
   const busy = new Map<string, AbortController>();
+  // Download state outlives the rows: a redraw (search, another install) rebuilds them mid-download.
+  const progressOf = new Map<string, { loaded: number; total: number; phase: string }>();
+  const liveRow = new Map<string, { progress: HTMLProgressElement; btn: HTMLButtonElement }>();
+  const paint = (id: string) => {
+    const l = liveRow.get(id), p = progressOf.get(id);
+    if (!l) return;
+    const on = busy.has(id);
+    l.progress.hidden = !on;
+    l.btn.textContent = on ? 'Cancel' : 'Download';
+    if (p) { l.progress.max = p.total || 1; l.progress.value = p.loaded; l.btn.title = p.phase; }
+  };
 
   const showCurrent = () => {
     const lang = app.prefs.language || 'en-US';
@@ -65,28 +76,31 @@ export async function openDictionaryWizard(app: App): Promise<void> {
         },
       }, 'Remove'));
     } else {
-      actions.append(progress, h('button', {
-        class: 'ql-btn ql-primary', onclick: async (e: Event) => {
-          const btn = e.currentTarget as HTMLButtonElement;
+      const dl = h('button', {
+        class: 'ql-btn ql-primary', onclick: async () => {
           if (busy.has(d.id)) { busy.get(d.id)!.abort(); return; }
           if (isHeavy(d) && !(await confirmDialog('Large dictionary', `${d.name} is a large dictionary (${mb(d)}, about ${d.memoryMB || '?'} MB of memory when loaded). Checking may start slowly, and older phones may not have enough memory. Download it anyway?`, 'Download'))) return;
           const ctl = new AbortController();
           busy.set(d.id, ctl);
-          btn.textContent = 'Cancel';
-          progress.hidden = false;
+          progressOf.set(d.id, { loaded: 0, total: 1, phase: '' });
+          paint(d.id);
           try {
-            await installDictionary(d.id, (p) => { progress.max = p.total || 1; progress.value = p.loaded; btn.title = p.phase; }, ctl.signal);
+            await installDictionary(d.id, (p) => { progressOf.set(d.id, { loaded: p.loaded, total: p.total || 1, phase: p.phase }); paint(d.id); }, ctl.signal);
             installed = await installedDictionaries();
             toast(`${d.name} dictionary installed`, { action: 'Use for spelling', onAction: () => { useLanguage(app, d); showCurrent(); draw(); } });
           } catch (err) {
             if ((err as Error)?.name !== 'AbortError') toast(`Could not install ${d.name}: ${(err as Error)?.message || err}`, { ms: 8000 });
           } finally {
             busy.delete(d.id);
+            progressOf.delete(d.id);
             showCurrent();
             draw();
           }
         },
-      }, 'Download'));
+      }, 'Download') as HTMLButtonElement;
+      actions.append(progress, dl);
+      liveRow.set(d.id, { progress, btn: dl });
+      paint(d.id);
     }
     return h('div', { class: 'ql-dict-row', role: 'listitem' }, info, actions);
   };

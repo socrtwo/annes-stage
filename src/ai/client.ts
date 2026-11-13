@@ -2,15 +2,17 @@
  * Provider-neutral chat client: OpenAI-compatible, Anthropic Messages, Gemini, Chrome's
  * built-in model, and the on-device model. Streams where the platform allows.
  *
- * HTTP goes through fetch (streaming). In the Android, iOS and desktop apps, when a provider blocks browser
- * CORS (or fetch fails at the network layer), the request is retried through Capacitor's
- * native HTTP without streaming.
+ * HTTP goes through fetch (streaming). In the Android, iOS and desktop apps, a provider known to block
+ * browser CORS goes straight to native HTTP (no streaming). A provider whose CORS support is unknown
+ * falls back to native HTTP only when fetch failed before any response arrived (the way a CORS refusal
+ * fails), and is then sent natively for the rest of the session; a request that got a response is
+ * never sent again. Every request gives up after AI_TIMEOUT_MS (streams: of silence).
  */
 import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import { desktopHttp } from '../platform/native';
 import { aiSettings, resolveProvider, recordUsage, type ResolvedProvider } from './store';
 import { providerById, type ProviderDef } from './providers';
-import { AiError } from './errors';
+import { AiError, AI_TIMEOUT_MS } from './errors';
 import { planEnsemble, runEnsemble, type EnsembleInfo, type EnsemblePlan } from './ensemble';
 
 export type ContentPart = { type: 'text'; text: string } | { type: 'image'; dataUrl: string };
@@ -53,6 +55,40 @@ const isNativeApp = () => Capacitor.isNativePlatform() || !!desktopHttp;
 interface HttpReq { url: string; method?: 'GET' | 'POST'; headers: Record<string, string>; body?: unknown; signal?: AbortSignal }
 interface HttpRes { status: number; text: string }
 
+/** Providers whose browser requests failed the way CORS refusals do: sent through native HTTP from then on (this session). */
+const nativeNeeded = new Set<string>();
+
+/**
+ * Whether a failed fetch may be repeated through native HTTP: only in the apps, only for providers that
+ * may block CORS, and only for a TypeError from fetch itself (no response arrived, so the server did
+ * not answer the request). The desktop bridge only makes https requests.
+ */
+function mayRetryNative(def: ProviderDef, e: unknown, url: string): boolean {
+  if (!isNativeApp() || !(e instanceof TypeError)) return false;
+  if (def.cors !== 'no' && def.cors !== 'unknown' && def.cors !== 'local') return false;
+  return !(desktopHttp && /^http:\/\//i.test(url));
+}
+
+/** The caller's signal plus a timeout; `poke()` restarts the timeout (a stream that is still sending). */
+function timed(signal: AbortSignal | undefined, ms = AI_TIMEOUT_MS) {
+  const ctl = new AbortController();
+  let timedOut = false;
+  const fire = () => { timedOut = true; ctl.abort(); };
+  let timer = setTimeout(fire, ms);
+  const onAbort = () => ctl.abort();
+  if (signal?.aborted) ctl.abort();
+  else signal?.addEventListener('abort', onAbort, { once: true });
+  return {
+    signal: ctl.signal,
+    get timedOut() { return timedOut; },
+    poke() { clearTimeout(timer); timer = setTimeout(fire, ms); },
+    done() { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); },
+  };
+}
+
+const stoppedError = () => new AiError('Stopped', 'aborted');
+const timeoutError = (def: ProviderDef, ms = AI_TIMEOUT_MS) => new AiError(`${def.name} did not answer within ${Math.round(ms / 1000)} seconds.`, 'network');
+
 /** Native requests cannot be canceled: Stop stops waiting for them, and the late answer is dropped. */
 function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return p;
@@ -67,7 +103,7 @@ function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
 async function viaNative(def: ProviderDef, r: HttpReq): Promise<HttpRes> {
   if (r.signal?.aborted) throw new AiError('Stopped', 'aborted');
   const req = desktopHttp
-    ? desktopHttp({ url: r.url, method: r.method || 'GET', headers: r.headers, data: r.body })
+    ? desktopHttp({ url: r.url, method: r.method || 'GET', headers: r.headers, data: r.body, timeoutMs: AI_TIMEOUT_MS }, r.signal)
     : CapacitorHttp.request({ url: r.url, method: r.method || 'GET', headers: r.headers, data: r.body, responseType: 'text', connectTimeout: 30000, readTimeout: 180000 })
       .then((res) => ({ status: res.status, text: typeof res.data === 'string' ? res.data : JSON.stringify(res.data) }));
   try {
@@ -78,17 +114,27 @@ async function viaNative(def: ProviderDef, r: HttpReq): Promise<HttpRes> {
   }
 }
 
-/** Plain request. Falls back to native HTTP in the app when the browser layer refuses. */
+/** Plain request. In the apps, falls back to native HTTP when the browser layer refused before any response (see mayRetryNative). */
 async function http(def: ProviderDef, r: HttpReq): Promise<HttpRes> {
-  if (isNativeApp() && def.cors === 'no') return viaNative(def, r);
+  if (isNativeApp() && (def.cors === 'no' || nativeNeeded.has(def.id))) return viaNative(def, r);
+  const t = timed(r.signal);
+  let res: Response;
   try {
-    const res = await fetch(r.url, { method: r.method || 'GET', headers: r.headers, body: r.body == null ? undefined : JSON.stringify(r.body), signal: r.signal });
+    res = await fetch(r.url, { method: r.method || 'GET', headers: r.headers, body: r.body == null ? undefined : JSON.stringify(r.body), signal: t.signal });
+  } catch (e: any) {
+    t.done();
+    if (e?.name === 'AbortError') throw t.timedOut ? timeoutError(def) : stoppedError();
+    if (mayRetryNative(def, e, r.url)) { nativeNeeded.add(def.id); return viaNative(def, r); }
+    throw networkError(def, e, r.url);
+  }
+  // A response has started: whatever happens now, the request is not sent again.
+  try {
     return { status: res.status, text: await res.text() };
   } catch (e: any) {
-    if (e?.name === 'AbortError') throw new AiError('Stopped', 'aborted');
-    // The desktop bridge only makes https requests: for a local http server keep the real error.
-    if (isNativeApp() && !(desktopHttp && /^http:\/\//i.test(r.url))) return viaNative(def, r);
+    if (e?.name === 'AbortError') throw t.timedOut ? timeoutError(def) : stoppedError();
     throw networkError(def, e, r.url);
+  } finally {
+    t.done();
   }
 }
 
@@ -120,15 +166,30 @@ export function takeSseBlocks(buf: string): [string[], string] {
 
 /** Streaming SSE request; returns null if streaming is unavailable here (caller retries without). */
 async function sse(def: ProviderDef, r: HttpReq, onEvent: (data: string, event: string) => void): Promise<{ status: number; text: string } | null> {
-  if (isNativeApp() && def.cors === 'no') return null;
+  if (isNativeApp() && (def.cors === 'no' || nativeNeeded.has(def.id))) return null;
+  const t = timed(r.signal);
   let res: Response;
   try {
-    res = await fetch(r.url, { method: 'POST', headers: r.headers, body: JSON.stringify(r.body), signal: r.signal });
+    res = await fetch(r.url, { method: 'POST', headers: r.headers, body: JSON.stringify(r.body), signal: t.signal });
   } catch (e: any) {
-    if (e?.name === 'AbortError') throw new AiError('Stopped', 'aborted');
-    if (isNativeApp()) return null;
+    t.done();
+    if (e?.name === 'AbortError') throw t.timedOut ? timeoutError(def) : stoppedError();
+    // Refused before any response: the caller sends it again without streaming, through native HTTP.
+    if (mayRetryNative(def, e, r.url)) { nativeNeeded.add(def.id); return null; }
     throw networkError(def, e, r.url);
   }
+  try {
+    return await readSse(res, t, onEvent);
+  } catch (e: any) {
+    if (e?.name === 'AbortError') throw t.timedOut ? timeoutError(def) : stoppedError();
+    if (e instanceof AiError) throw e;
+    throw networkError(def, e, r.url);
+  } finally {
+    t.done();
+  }
+}
+
+async function readSse(res: Response, t: ReturnType<typeof timed>, onEvent: (data: string, event: string) => void): Promise<{ status: number; text: string }> {
   if (!res.ok || !res.body) return { status: res.status, text: await res.text() };
   const reader = res.body.getReader();
   const dec = new TextDecoder();
@@ -146,6 +207,7 @@ async function sse(def: ProviderDef, r: HttpReq, onEvent: (data: string, event: 
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      t.poke();
       buf += dec.decode(value, { stream: true });
       const [blocks, rest] = takeSseBlocks(buf);
       buf = rest;
@@ -154,7 +216,6 @@ async function sse(def: ProviderDef, r: HttpReq, onEvent: (data: string, event: 
     buf += dec.decode();
     if (buf.trim()) dispatch(buf);
   } catch (e: any) {
-    if (e?.name === 'AbortError') throw new AiError('Stopped', 'aborted');
     void reader.cancel().catch(() => undefined);
     throw e;
   }
@@ -193,13 +254,15 @@ async function openaiChat(rp: ResolvedProvider, model: string, req: ChatRequest)
   if (req.temperature != null) params.temperature = req.temperature;
   if (req.maxTokens) params[def.completionTokens ? 'max_completion_tokens' : 'max_tokens'] = req.maxTokens;
   const url = `${baseUrl}/chat/completions`;
+  // Token usage in a stream: only the official OpenAI API is known to accept stream_options (some compatible servers reject unknown fields).
+  let streamUsage = def.id === 'openai' && /^https:\/\/api\.openai\.com\//i.test(url);
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
     let full = '';
     let finish: unknown = null;
     let usage: { in: number; out: number } | undefined;
     if (req.onToken) {
-      const r = await sse(def, { url, headers, body: { ...params, stream: true }, signal: req.signal }, (data) => {
+      const r = await sse(def, { url, headers, body: { ...params, stream: true, ...(streamUsage ? { stream_options: { include_usage: true } } : {}) }, signal: req.signal }, (data) => {
         if (data === '[DONE]') return;
         let j: any;
         try { j = JSON.parse(data); } catch { return; /* keep-alive or partial */ }
@@ -213,6 +276,7 @@ async function openaiChat(rp: ResolvedProvider, model: string, req: ChatRequest)
       });
       if (r && r.status === 200) return { text: full, model, provider: def.id, providerName: def.name, usage, truncated: cutShort(finish) };
       if (r) {
+        if (streamUsage && r.status === 400 && /stream_options|include_usage/i.test(r.text)) { streamUsage = false; continue; }
         const retry = adjustParams(params, r.text);
         if (retry) continue;
         throw httpError(def, r.status, r.text, model);

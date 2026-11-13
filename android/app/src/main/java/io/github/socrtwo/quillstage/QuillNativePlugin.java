@@ -10,6 +10,7 @@ import android.os.PersistableBundle;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.UriPermission;
 import android.database.Cursor;
 import android.net.Uri;
 import android.print.PrintAttributes;
@@ -81,6 +82,13 @@ public class QuillNativePlugin extends Plugin {
     private static final long MAX_READ_BYTES = 64L * 1024L * 1024L;
 
     private AiSupport.Loopback loopback;
+
+    /**
+     * content: URIs this app was given in this process (picker results, files opened from other apps).
+     * readUri/writeUri accept only these and URIs with a persisted grant, never file: or other schemes,
+     * so page content cannot use the bridge to read or overwrite arbitrary files.
+     */
+    private static final java.util.Set<String> sessionUris = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private final Object launchLock = new Object();
     private boolean launchFileConsumed = false;
@@ -265,6 +273,11 @@ public class QuillNativePlugin extends Plugin {
             resolveCanceled(call);
             return;
         }
+        if (!isContentUri(uri)) {
+            call.reject("Only documents from Android's file picker can be opened");
+            return;
+        }
+        sessionUris.add(uri.toString());
         takePersistablePermission(uri);
         io.execute(() -> {
             try {
@@ -315,6 +328,11 @@ public class QuillNativePlugin extends Plugin {
             call.reject("The presentation was not kept while the file picker was open. Please save again.");
             return;
         }
+        if (!isContentUri(uri)) {
+            call.reject("Only locations from Android's file picker can be saved to");
+            return;
+        }
+        sessionUris.add(uri.toString());
         io.execute(() -> {
             try {
                 writeBytes(uri, decodeBase64(data));
@@ -338,9 +356,14 @@ public class QuillNativePlugin extends Plugin {
             call.reject("writeUri requires 'uri' and 'data'");
             return;
         }
+        final Uri target = Uri.parse(uriString);
+        if (!isGrantedUri(target, true)) {
+            call.reject("Anne's Stage has no permission to write this file; save it again with Save As.");
+            return;
+        }
         io.execute(() -> {
             try {
-                writeBytes(Uri.parse(uriString), decodeBase64(data));
+                writeBytes(target, decodeBase64(data));
                 JSObject ret = new JSObject();
                 ret.put("ok", true);
                 call.resolve(ret);
@@ -357,9 +380,14 @@ public class QuillNativePlugin extends Plugin {
             call.reject("readUri requires 'uri'");
             return;
         }
+        final Uri source = Uri.parse(uriString);
+        if (!isGrantedUri(source, false)) {
+            call.reject("Anne's Stage has no permission to read this file; open it again.");
+            return;
+        }
         io.execute(() -> {
             try {
-                call.resolve(readDocument(Uri.parse(uriString), null));
+                call.resolve(readDocument(source, null));
             } catch (Throwable e) {
                 call.reject("Could not read presentation: " + e.getMessage(), asException(e));
             }
@@ -616,6 +644,11 @@ public class QuillNativePlugin extends Plugin {
         if (uri == null) {
             return null;
         }
+        // Only content: URIs (a provider granted access); a file: path would let any app make this one read its own private files.
+        if (!isContentUri(uri)) {
+            throw new IOException("Only files shared through Android's document system can be opened (not " + uri.getScheme() + ": addresses)");
+        }
+        sessionUris.add(uri.toString());
         takePersistablePermission(uri);
         return readDocument(uri, intent.getType());
     }
@@ -782,6 +815,31 @@ public class QuillNativePlugin extends Plugin {
             default:
                 return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext);
         }
+    }
+
+    private static boolean isContentUri(Uri uri) {
+        return uri != null && ContentResolver.SCHEME_CONTENT.equals(uri.getScheme());
+    }
+
+    /** A content: URI received this session, or one with a persisted grant for reading (or writing). */
+    private boolean isGrantedUri(Uri uri, boolean write) {
+        if (!isContentUri(uri)) {
+            return false;
+        }
+        if (sessionUris.contains(uri.toString())) {
+            return true;
+        }
+        try {
+            List<UriPermission> perms = getContext().getContentResolver().getPersistedUriPermissions();
+            for (UriPermission p : perms) {
+                if (uri.equals(p.getUri()) && (write ? p.isWritePermission() : p.isReadPermission())) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Could not list persisted URI permissions", e);
+        }
+        return false;
     }
 
     private void takePersistablePermission(Uri uri) {
