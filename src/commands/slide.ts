@@ -477,15 +477,16 @@ def([
     },
   },
   {
-    id: 'outline.promote', label: 'Promote', icon: 'format_indent_decrease', tab: 'View', group: 'Outline', keys: ['Alt-Shift-ArrowLeft'], edits: true,
+    // Alt+Shift+Left/Right belong to Decrease/Increase List Level, which run these in Outline view.
+    id: 'outline.promote', label: 'Promote', icon: 'format_indent_decrease', tab: 'View', group: 'Outline', edits: true,
     tip: 'Raise the selected paragraphs one level; a top-level paragraph becomes a new slide',
     run: (app) => {
-      if (app.tab.ui.editingText) { app.exec('fmt.outdent'); return; }
+      if (app.tab.ui.editingText || app.tab.view !== 'outline') { app.exec('fmt.outdent', 'para'); return; }
       const s = app.slide;
       if (!s) return;
       const paras = bodyParas(s);
       const last = paras[paras.length - 1];
-      if (!last || last.level > 0) { app.exec('fmt.outdent'); return; }
+      if (!last || last.level > 0) { app.exec('fmt.outdent', 'para'); return; }
       // The slide's last top-level paragraph (and what follows it) becomes the next slide.
       const d = app.deck;
       const lays = layoutsHere(app);
@@ -503,10 +504,10 @@ def([
     },
   },
   {
-    id: 'outline.demote', label: 'Demote', icon: 'format_indent_increase', tab: 'View', group: 'Outline', keys: ['Alt-Shift-ArrowRight'], edits: true,
+    id: 'outline.demote', label: 'Demote', icon: 'format_indent_increase', tab: 'View', group: 'Outline', edits: true,
     tip: 'Lower the selected paragraphs one level; a slide demoted becomes a bullet of the slide before it',
     run: (app) => {
-      if (app.tab.ui.editingText || app.tab.view !== 'outline') { app.exec('fmt.indent'); return; }
+      if (app.tab.ui.editingText || app.tab.view !== 'outline') { app.exec('fmt.indent', 'para'); return; }
       const d = app.deck;
       const s = app.slide;
       const i = s ? d.slideIndex(s.id) : -1;

@@ -56,6 +56,8 @@ export class DeckTab {
   recovery: any = null;
   /** Slides selected in the thumbnail rail or sorter (current slide included). */
   slideSel: string[] = [];
+  /** Position of the current slide when last seen, so deleting it moves to its neighbour. */
+  lastIndex = 0;
   constructor(public app: App, public deck: Deck) {
     this.current = deck.slides[0]?.id || '';
   }
@@ -73,6 +75,8 @@ export class App {
   private autosaveTimer: any = null;
   private listeners = new Set<(app: App) => void>();
   lastCommand: { id: string; arg?: any } | null = null;
+  /** How many commands are running inside one another (0 when idle). */
+  execDepth = 0;
   keyIndex = new Map<string, string>();
   /** Clipboard of slides and elements copied inside Anne's Stage. */
   clip: { kind: 'elements' | 'slides'; data: any; media: Record<string, any>; text: string; time: number } | null = null;
@@ -129,7 +133,7 @@ export class App {
     }
     const tab = new DeckTab(this, deck);
     Object.assign(tab, meta);
-    deck.onChange = () => this.deckChanged(tab);
+    this.watchDeck(deck);
     this.ui.mountTab(tab);
     this.docs.push(tab);
     this.activate(tab);
@@ -158,7 +162,7 @@ export class App {
 
   replaceDeck(tab: DeckTab, deck: Deck): void {
     tab.deck = deck;
-    deck.onChange = () => this.deckChanged(tab);
+    this.watchDeck(deck);
     tab.current = deck.slides[0]?.id || '';
     tab.slideSel = [];
     tab.ui.select([]);
@@ -166,10 +170,17 @@ export class App {
     this.refresh();
   }
 
+  /** Updates every open tab showing a deck (View ▸ New Window opens a second tab on the same deck). */
+  watchDeck(deck: Deck): void {
+    deck.onChange = () => { for (const d of this.docs) if (d.deck === deck) this.deckChanged(d); };
+  }
+
   /** Called after every transaction, undo and redo. */
   deckChanged(tab: DeckTab): void {
-    // Keep the current slide valid after deletions and undo.
-    if (!tab.deck.slide(tab.current)) tab.current = tab.deck.slides[Math.min(tab.deck.slides.length - 1, 0)]?.id || '';
+    // Keep the current slide valid after deletions and undo: stay at the same position.
+    const n = tab.deck.slides.length;
+    if (!tab.deck.slide(tab.current)) tab.current = tab.deck.slides[Math.max(0, Math.min(n - 1, tab.lastIndex))]?.id || '';
+    tab.lastIndex = Math.max(0, tab.deck.slideIndex(tab.current));
     tab.slideSel = tab.slideSel.filter((id) => tab.deck.slide(id));
     if (!tab.dirty) { tab.dirty = true; this.ui.tabsChanged(); document.title = `${tab.displayName} • – Anne\'s Stage`; }
     this.scheduleAutosave();
@@ -188,6 +199,7 @@ export class App {
       t.slideSel = t.deck.slides.slice(Math.min(a, b), Math.max(a, b) + 1).map((s) => s.id);
     } else t.slideSel = [id];
     t.current = id;
+    t.lastIndex = Math.max(0, t.deck.slideIndex(id));
     t.ui.select([]);
     t.ui.invalidate();
     this.refresh();
@@ -206,6 +218,7 @@ export class App {
     requestAnimationFrame(() => {
       this.refreshQueued = false;
       if (!this.active) return;
+      for (const d of this.docs) { const i = d.deck.slideIndex(d.current); if (i >= 0) d.lastIndex = i; }
       this.ui.refresh();
       for (const l of this.listeners) l(this);
     });
@@ -233,8 +246,11 @@ export class App {
     if (!c) { toast(`Unknown command: ${id}`); return false; }
     if (c.edits && this.isReadOnly()) { toast('This presentation is read-only.'); return false; }
     if (c.isEnabled && !c.isEnabled(this)) { toast(`${c.label} is not available here.`); return false; }
-    if (this.recording && !c.noRecord && id !== 'dev.recordMacro' && id !== 'dev.stopRecording') this.recordStep(id, arg);
-    if (!c.noRecord && id !== 'edit.repeat') this.lastCommand = { id, arg };
+    // Only commands the user ran are recorded and repeated, not the ones they run in turn.
+    const top = this.execDepth === 0;
+    if (top && this.recording && !c.noRecord && id !== 'dev.recordMacro' && id !== 'dev.stopRecording') this.recordStep(id, arg);
+    if (top && !c.noRecord && id !== 'edit.repeat') this.lastCommand = { id, arg };
+    this.execDepth++;
     try {
       const r = c.run(this, arg);
       if (r instanceof Promise) r.catch((e) => this.reportError(c, e)).finally(() => this.refresh());
@@ -243,6 +259,8 @@ export class App {
     } catch (e) {
       this.reportError(c, e);
       return false;
+    } finally {
+      this.execDepth--;
     }
   }
 
@@ -264,14 +282,26 @@ export class App {
     this.autosaveTimer = setTimeout(() => { this.autosaveTimer = null; void this.saveDrafts(); }, Math.max(3, this.prefs.autosaveSeconds) * 1000);
   }
 
-  async saveDrafts(): Promise<void> {
+  async saveDrafts(): Promise<boolean> {
+    let saved = 0;
+    const failed: string[] = [];
     for (const tab of this.docs) {
       if (!tab.dirty) continue;
       try {
         await kvSet('draft:' + tab.id, { id: tab.id, json: tab.deck.toJSON(), title: tab.title, fileName: tab.fileName, format: tab.format, uri: tab.uri, key: tab.key, time: Date.now() });
-      } catch { /* storage full */ }
+        saved++;
+      } catch (e) {
+        console.warn(e);
+        failed.push(tab.displayName);
+      }
     }
-    this.ui.status?.('Draft saved');
+    if (failed.length) {
+      this.ui.status?.('Draft not saved');
+      toast(`AutoSave could not store a draft of ${failed.join(', ')} (storage may be full). Save the presentation to keep your changes.`, { ms: 9000 });
+      return false;
+    }
+    if (saved) this.ui.status?.('Draft saved');
+    return true;
   }
 
   followLink(href: string): void {

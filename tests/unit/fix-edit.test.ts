@@ -82,7 +82,7 @@ describe('AutoCorrect ignores inherited object keys (4)', () => {
     const s = d.slides[0];
     const app: any = { deck: d, prefs: { spellcheck: false, autoCorrect: false, replacements: {} } };
     // jsdom does not focus contenteditable elements, so watch the call instead.
-    const focused: Element[] = [];
+    const focused: globalThis.Element[] = [];
     const orig = HTMLElement.prototype.focus;
     HTMLElement.prototype.focus = function (this: HTMLElement) { focused.push(this); };
     let ed: TextEditor;

@@ -129,6 +129,12 @@ const ENUMS: Partial<Record<keyof Prefs, readonly string[]>> = {
   qatPosition: ['top', 'below', 'bottom'], theme: ['system', 'light', 'dark'], ribbon: ['full', 'tabs', 'hidden'],
   spellDialect: ['any', 'document', 'en-US', 'en-GB', 'en-CA', 'en-AU'], defaultSize: ['wide', 'standard'],
 };
+/** Allowed ranges of numeric preferences: [min, max, integer]. Out-of-range values are clamped; non-numbers use the default. */
+export const NUMERIC_RANGES: Partial<Record<keyof Prefs, [number, number, boolean?]>> = {
+  gridSize: [2, 144], uiScale: [0.5, 2], autosaveSeconds: [3, 3600], readAloudRate: [0.1, 10],
+  defaultTheme: [0, 999, true], timerWarn: [0, 86400],
+};
+
 const isObj = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
 const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
 
@@ -140,7 +146,17 @@ export function sanitizePrefs(raw: unknown): Partial<Prefs> {
   for (const [k, v] of Object.entries(raw)) {
     if (!(k in d)) continue;
     const def = d[k];
-    if (Array.isArray(def) ? Array.isArray(v) : isObj(def) ? isObj(v) : typeof v === typeof def && (typeof v !== 'number' || Number.isFinite(v))) out[k] = v;
+    if (typeof def === 'number') {
+      // Numbers (also numeric strings from forms) are clamped to their range; anything else is the default.
+      const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() ? Number(v) : NaN;
+      const range = NUMERIC_RANGES[k as keyof Prefs];
+      if (!Number.isFinite(n)) { out[k] = def; continue; }
+      let x = range ? Math.min(range[1], Math.max(range[0], n)) : n;
+      if (range?.[2]) x = Math.round(x);
+      out[k] = x;
+      continue;
+    }
+    if (Array.isArray(def) ? Array.isArray(v) : isObj(def) ? isObj(v) : typeof v === typeof def) out[k] = v;
   }
   for (const [k, ok] of Object.entries(ENUMS)) if (k in out && !ok!.includes(out[k])) delete out[k];
   for (const k of ['qat', 'hiddenTabs', 'tabOrder', 'dictionary', 'ignoredWords', 'pinnedCommands']) if (k in out) out[k] = strings(out[k]);

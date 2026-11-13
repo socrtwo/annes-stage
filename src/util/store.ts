@@ -21,24 +21,43 @@ function open(): Promise<IDBDatabase | null> {
 export async function kvGet<T = any>(key: string): Promise<T | undefined> {
   const db = await open();
   if (!db) {
-    const v = localStorage.getItem('qlkv:' + key);
-    return v ? JSON.parse(v) : undefined;
+    try {
+      const v = localStorage.getItem('qlkv:' + key);
+      return v ? JSON.parse(v) : undefined;
+    } catch {
+      return undefined; // damaged or unreadable entry
+    }
   }
   return new Promise((resolve) => {
-    const r = db.transaction(OS).objectStore(OS).get(key);
-    r.onsuccess = () => resolve(r.result as T);
-    r.onerror = () => resolve(undefined);
+    try {
+      const r = db.transaction(OS).objectStore(OS).get(key);
+      r.onsuccess = () => resolve(r.result as T);
+      r.onerror = () => resolve(undefined);
+    } catch {
+      resolve(undefined);
+    }
   });
 }
 
+/** Stores a value. Rejects when it could not be stored (quota exceeded, aborted transaction), so callers can tell the user. */
 export async function kvSet(key: string, value: any): Promise<void> {
   const db = await open();
-  if (!db) { try { localStorage.setItem('qlkv:' + key, JSON.stringify(value)); } catch { /* */ } return; }
-  return new Promise((resolve) => {
-    const tx = db.transaction(OS, 'readwrite');
-    tx.objectStore(OS).put(value, key);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => resolve();
+  if (!db) {
+    localStorage.setItem('qlkv:' + key, JSON.stringify(value)); // throws QuotaExceededError when full
+    return;
+  }
+  return new Promise((resolve, reject) => {
+    const fail = (e: unknown) => reject(e instanceof Error || (e && typeof e === 'object') ? e : new Error(`Could not store ${key}`));
+    try {
+      const tx = db.transaction(OS, 'readwrite');
+      const req = tx.objectStore(OS).put(value, key);
+      req.onerror = () => fail(req.error || new Error(`Could not store ${key}`));
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => fail(tx.error || new Error(`Could not store ${key}`));
+      tx.onabort = () => fail(tx.error || new Error(`Storing ${key} was aborted (storage may be full)`));
+    } catch (e) {
+      fail(e);
+    }
   });
 }
 

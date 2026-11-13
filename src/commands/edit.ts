@@ -9,7 +9,7 @@ import { edit, selection, deleteSelection, duplicateSelection, reId, forEachText
 import { activeTextEditor } from '../edit/textEdit';
 import { openDialog, toast } from '../ui/dialog';
 import { readClipboardText, writeClipboardText } from '../platform/native';
-import { registerPane } from '../ui/panes';
+import { registerPane, canEdit } from '../ui/panes';
 import { h, clear, icon } from '../ui/dom';
 
 export interface ClipItem { kind: 'elements' | 'slides'; data: any; media: Record<string, any>; text: string; time: number; design?: { layouts: Layout[]; masters: any[]; themes: any[] } }
@@ -221,22 +221,73 @@ function startPainter(app: App, sticky: boolean): void {
 // ------------------------------------------------------------------------------------------
 // Find and replace
 
-interface Hit { slide: string; el: string | null; para: number; off: number; len: number }
+/** A match: slide, element (null for notes), text-body index within the slide (one per shape, table cell or notes), paragraph and offset. */
+export interface Hit { slide: string; el: string | null; body: number; para: number; off: number; len: number }
+export interface FindOpts { matchCase: boolean; whole: boolean; notes: boolean }
 
-function findAll(deck: Deck, needle: string, opts: { matchCase: boolean; whole: boolean; notes: boolean }): Hit[] {
-  if (!needle) return [];
+/** The regular expression Find uses; whole words use Unicode-aware boundaries so "C++" and "café" work. */
+export function findRegExp(needle: string, opts: { matchCase: boolean; whole: boolean }): RegExp {
   const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(opts.whole ? `\\b${esc}\\b` : esc, opts.matchCase ? 'g' : 'gi');
+  return new RegExp(opts.whole ? `(?<![\\p{L}\\p{N}_])${esc}(?![\\p{L}\\p{N}_])` : esc, opts.matchCase ? 'gu' : 'giu');
+}
+
+export function findAll(deck: Deck, needle: string, opts: FindOpts): Hit[] {
+  if (!needle) return [];
+  const re = findRegExp(needle, opts);
   const hits: Hit[] = [];
   for (const s of deck.slides) {
+    let body = -1;
     forEachText([s], (paras, el) => {
+      body++;
       paras.forEach((p, pi) => {
         const t = p.runs.map((r) => (r.br ? '\n' : r.text)).join('');
-        for (const m of t.matchAll(re)) hits.push({ slide: s.id, el: el ? el.id : null, para: pi, off: m.index!, len: m[0].length });
+        for (const m of t.matchAll(re)) if (m[0].length) hits.push({ slide: s.id, el: el ? el.id : null, body, para: pi, off: m.index!, len: m[0].length });
       });
     }, opts.notes);
   }
   return hits;
+}
+
+/** The paragraph a hit points into (the same table cell, not just the same table). */
+function hitPara(deck: Deck, h2: Hit, notes: boolean): Paragraph | undefined {
+  const s = deck.slide(h2.slide);
+  if (!s) return undefined;
+  let body = -1, out: Paragraph | undefined;
+  forEachText([s], (paras, el) => { if (++body === h2.body && (el?.id ?? null) === h2.el) out = paras[h2.para]; }, notes);
+  return out;
+}
+
+/** Compares hit positions in document order. */
+function cmpPos(a: Hit, b: { slide: string; body: number; para: number; off: number }, deck: Deck): number {
+  return deck.slideIndex(a.slide) - deck.slideIndex(b.slide) || a.body - b.body || a.para - b.para || a.off - b.off;
+}
+
+/**
+ * Replaces hit `at` (or the first match) and returns the index of the next match after the inserted text,
+ * so the replacement is never matched again; -1 when there are no more matches after it.
+ */
+export function replaceOne(deck: Deck, needle: string, repl: string, opts: FindOpts, at: number): { replaced: boolean; next: number; hits: Hit[] } {
+  let hits = findAll(deck, needle, opts);
+  if (!hits.length || at >= hits.length) return { replaced: false, next: -1, hits };
+  const h2 = hits[Math.max(0, at)];
+  deck.transact('Replace', () => { const p = hitPara(deck, h2, opts.notes); if (p) replaceInPara(p, h2.off, h2.len, repl); }, [h2.slide]);
+  hits = findAll(deck, needle, opts);
+  const after = { slide: h2.slide, body: h2.body, para: h2.para, off: h2.off + repl.length };
+  const next = hits.findIndex((x) => cmpPos(x, after, deck) >= 0);
+  return { replaced: true, next, hits };
+}
+
+/** Replaces every match; returns how many. */
+export function replaceAll(deck: Deck, needle: string, repl: string, opts: FindOpts): number {
+  const all = findAll(deck, needle, opts);
+  if (!all.length) return 0;
+  deck.transact('Replace All', () => {
+    // Resolve each paragraph first, then replace from the end so earlier offsets stay valid.
+    const targets = all.map((h2) => ({ h2, p: hitPara(deck, h2, opts.notes) }));
+    targets.sort((a, b) => b.h2.off - a.h2.off);
+    for (const { h2, p } of targets) if (p) replaceInPara(p, h2.off, h2.len, repl);
+  });
+  return all.length;
 }
 
 /** Replaces [off, off+len) of a paragraph's text, keeping the formatting of the first affected run. */
@@ -278,31 +329,26 @@ async function findDialog(app: App, replace: boolean): Promise<void> {
       { key: 'notes', label: 'Search speaker notes too', type: 'checkbox', value: true },
     ],
     buttons: [
-      { label: 'Find Next', onClick: (v: any, ctl: any) => { ctlRef = ctl; hits = findAll(app.deck, v.q, opts()); if (!hits.length) { toast(`"${v.q}" was not found.`); return; } at = (at + 1) % hits.length; show(hits[at]); } },
+      { label: 'Find Next', onClick: (v: any, ctl: any) => { ctlRef = ctl; hits = findAll(app.deck, v.q, opts()); if (!hits.length) { toast(`"${v.q}" was not found.`); return; } at = at + 1 >= hits.length ? 0 : at + 1; show(hits[at]); } },
       ...(replace ? [
         { label: 'Replace', onClick: (v: any, ctl: any) => {
           ctlRef = ctl;
-          hits = findAll(app.deck, v.q, opts());
-          if (!hits.length) { toast(`"${v.q}" was not found.`); return; }
-          const h2 = hits[Math.max(0, Math.min(at, hits.length - 1))];
-          const s = app.deck.slide(h2.slide)!;
-          app.deck.transact('Replace', () => { let k = -1; forEachText([s], (paras, el) => { if ((el?.id ?? null) === h2.el && ++k === 0) replaceInPara(paras[h2.para], h2.off, h2.len, v.r); }, h2.el === null); }, [s.id]);
-          hits = findAll(app.deck, v.q, opts());
-          if (hits.length) { at = Math.min(at, hits.length - 1); show(hits[Math.max(0, at)]); }
+          if (app.isReadOnly()) { toast('This presentation is read-only.'); return; }
+          if (at >= hits.length && hits.length) { toast('Reached the end of the presentation.'); at = -1; return; }
+          const r = replaceOne(app.deck, v.q, v.r ?? '', opts(), at);
+          hits = r.hits;
+          if (!r.replaced) { toast(`"${v.q}" was not found.`); return; }
+          if (r.next < 0) { at = hits.length; app.ui.status('Reached the end of the presentation.'); return; }
+          at = r.next;
+          show(hits[at]);
         } },
         { label: 'Replace All', onClick: (v: any, ctl: any) => {
           ctlRef = ctl;
-          const all = findAll(app.deck, v.q, opts());
-          if (!all.length) { toast(`"${v.q}" was not found.`); return; }
-          app.deck.transact('Replace All', () => {
-            // Replace from the end of each paragraph so earlier offsets stay valid.
-            const sorted = [...all].sort((a, b) => b.off - a.off);
-            for (const h2 of sorted) {
-              const s = app.deck.slide(h2.slide)!;
-              forEachText([s], (paras, el) => { if ((el?.id ?? null) === h2.el) replaceInPara(paras[h2.para], h2.off, h2.len, v.r); }, h2.el === null);
-            }
-          });
-          toast(`Replaced ${all.length} occurrence${all.length > 1 ? 's' : ''}.`);
+          if (app.isReadOnly()) { toast('This presentation is read-only.'); return; }
+          const n = replaceAll(app.deck, v.q, v.r ?? '', opts());
+          if (!n) { toast(`"${v.q}" was not found.`); return; }
+          hits = []; at = -1;
+          toast(`Replaced ${n} occurrence${n > 1 ? 's' : ''}.`);
         } },
       ] : []),
     ],
@@ -437,7 +483,7 @@ def([
     run: (app) => app.exec('edit.selectAll'),
   },
   { id: 'edit.find', label: 'Find', icon: 'search', tab: 'Home', group: 'Editing', keys: ['Mod-f'], popular: true, noRecord: true, run: (app) => findDialog(app, false) },
-  { id: 'edit.replace', label: 'Replace', icon: 'find_replace', tab: 'Home', group: 'Editing', keys: ['Mod-h'], noRecord: true, run: (app) => findDialog(app, true) },
+  { id: 'edit.replace', label: 'Replace', icon: 'find_replace', tab: 'Home', group: 'Editing', keys: ['Mod-h'], noRecord: true, edits: true, run: (app) => findDialog(app, true) },
   {
     id: 'edit.replaceFonts', label: 'Replace Fonts…', icon: 'font_download', tab: 'Home', group: 'Editing', edits: true,
     tip: 'Change every use of one font to another, across all slides, layouts and masters',
@@ -480,7 +526,7 @@ registerPane({
     if (!clipHistory.length) el.appendChild(h('p', { class: 'ql-help' }, 'Cut or copy objects, slides or text to collect items here, then click an item to paste it.'));
     for (const it of clipHistory) {
       const label = it.kind === 'slides' ? `${it.data.length} slide(s)` : `${it.data.length} object(s)`;
-      el.appendChild(h('button', { class: 'ql-nav-item', onclick: () => { app.clip = it; if (it.kind === 'slides') pasteSlides(app, it); else pasteElements(app, it); } }, icon(it.kind === 'slides' ? 'slideshow' : 'category'), h('span', null, label), h('span', { class: 'ql-help' }, (it.text || '').slice(0, 80))));
+      el.appendChild(h('button', { class: 'ql-nav-item', onclick: () => { if (!canEdit(app)) return; app.clip = it; if (it.kind === 'slides') pasteSlides(app, it); else pasteElements(app, it); } }, icon(it.kind === 'slides' ? 'slideshow' : 'category'), h('span', null, label), h('span', { class: 'ql-help' }, (it.text || '').slice(0, 80))));
     }
   },
 });

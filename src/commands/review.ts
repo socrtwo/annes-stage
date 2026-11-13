@@ -7,7 +7,7 @@ import { edit, forEachText, shapeText } from '../edit/ops';
 import { splitRuns, paraText } from '../edit/textEdit';
 import { openDialog, toast, confirmDialog, promptDialog } from '../ui/dialog';
 import { h, clear, icon } from '../ui/dom';
-import { registerPane, typingIn } from '../ui/panes';
+import { registerPane, typingIn, canEdit } from '../ui/panes';
 import { isSlide, levelStyle, resolveBox } from '../model/inherit';
 import { contrastRatio, resolveColor, themeFont } from '../model/theme';
 import { effectiveBackground, slideTitle } from '../render/slide';
@@ -208,8 +208,8 @@ registerPane({
       const on = app.tab.ui.selection.includes(e.id);
       el.appendChild(h('div', { class: 'ql-nav-item' + (on ? ' ql-on' : ''), style: 'display:flex;gap:4px;align-items:center' },
         h('span', { style: 'flex:1;cursor:pointer', onclick: () => app.tab.ui.select([e.id]) }, `${i + 1}. ${e.name || e.kind}${e.decorative ? ' (decorative)' : !e.alt && e.kind !== 'shape' ? ' — no alt text' : ''}`),
-        h('button', { class: 'ql-iconbtn ql-sm', title: 'Read earlier', disabled: i === 0 ? '' : null, onclick: () => edit(app, 'Reading Order', (o) => { const l = o.elements; [l[i - 1], l[i]] = [l[i], l[i - 1]]; }) }, icon('arrow_upward')),
-        h('button', { class: 'ql-iconbtn ql-sm', title: 'Read later', disabled: i === s.elements.length - 1 ? '' : null, onclick: () => edit(app, 'Reading Order', (o) => { const l = o.elements; [l[i + 1], l[i]] = [l[i], l[i + 1]]; }) }, icon('arrow_downward'))));
+        h('button', { class: 'ql-iconbtn ql-sm', title: 'Read earlier', disabled: i === 0 ? '' : null, onclick: () => canEdit(app) && edit(app, 'Reading Order', (o) => { const l = o.elements; [l[i - 1], l[i]] = [l[i], l[i - 1]]; }) }, icon('arrow_upward')),
+        h('button', { class: 'ql-iconbtn ql-sm', title: 'Read later', disabled: i === s.elements.length - 1 ? '' : null, onclick: () => canEdit(app) && edit(app, 'Reading Order', (o) => { const l = o.elements; [l[i + 1], l[i]] = [l[i], l[i + 1]]; }) }, icon('arrow_downward'))));
     });
   },
 });
@@ -221,11 +221,12 @@ function allComments(app: App): { slide: Slide; c: Comment }[] {
   return app.deck.slides.flatMap((s) => (s.comments || []).map((c) => ({ slide: s, c })));
 }
 
-function addComment(app: App, text: string, target?: string): void {
+function addComment(app: App, text: string, target?: string): boolean {
   const s = slideOf(app);
-  if (!s) return;
+  if (!s || !canEdit(app)) return false;
   const c: Comment = { id: newId('cm'), author: app.prefs.author, initials: app.prefs.initials, time: Date.now(), text, ...(target ? { target } : {}) };
   app.deck.transact('New Comment', () => { (s.comments ||= []).push(c); }, [s.id]);
+  return true;
 }
 
 registerPane({
@@ -238,15 +239,17 @@ registerPane({
     el.dataset.sig = sig;
     clear(el);
     if (!s) return;
+    // Redraw now: the field the user typed in still has focus, which would hold the pane back.
+    const redraw = () => { delete el.dataset.sig; this.update!(app, el, {}); };
     const input = h('textarea', { class: 'ql-input', rows: '2', placeholder: 'Start a conversation…', style: 'width:100%' }) as HTMLTextAreaElement;
-    el.append(input, h('div', { class: 'ql-row' }, h('button', { class: 'ql-btn ql-primary', onclick: () => { const t = input.value.trim(); if (t) addComment(app, t, app.selected[0]?.id); } }, 'Post'),
+    el.append(input, h('div', { class: 'ql-row' }, h('button', { class: 'ql-btn ql-primary', onclick: () => { const t = input.value.trim(); if (t && addComment(app, t, app.selected[0]?.id)) { input.value = ''; input.blur(); redraw(); } } }, 'Post'),
       h('button', { class: 'ql-btn', onclick: () => app.exec('review.prevComment') }, icon('chevron_left')), h('button', { class: 'ql-btn', onclick: () => app.exec('review.nextComment') }, icon('chevron_right'))));
     const list = s.comments || [];
     if (!list.length) el.appendChild(h('p', { class: 'ql-help' }, 'No comments on this slide.'));
     for (const c of list) {
       const target = c.target ? s.elements.find((e) => e.id === c.target) : undefined;
       const reply = h('input', { class: 'ql-input', placeholder: 'Reply…', style: 'width:100%' }) as HTMLInputElement;
-      reply.addEventListener('keydown', (e) => { if (e.key === 'Enter' && reply.value.trim()) { const t = reply.value.trim(); app.deck.transact('Reply', () => { const cc = s.comments!.find((x) => x.id === c.id)!; (cc.replies ||= []).push({ id: newId('cm'), author: app.prefs.author, initials: app.prefs.initials, time: Date.now(), text: t }); }, [s.id]); } });
+      reply.addEventListener('keydown', (e) => { if (e.key === 'Enter' && reply.value.trim()) { e.preventDefault(); if (!canEdit(app)) return; const t = reply.value.trim(); reply.value = ''; reply.blur(); app.deck.transact('Reply', () => { const cc = s.comments!.find((x) => x.id === c.id)!; (cc.replies ||= []).push({ id: newId('cm'), author: app.prefs.author, initials: app.prefs.initials, time: Date.now(), text: t }); }, [s.id]); redraw(); } });
       el.appendChild(h('div', { class: 'qs-comment' + (c.resolved ? ' qs-resolved' : ''), style: `border:1px solid var(--line,#ccc);border-radius:6px;padding:6px;margin:6px 0;${c.resolved ? 'opacity:.6' : ''}` },
         h('div', null, h('b', null, c.author), h('span', { class: 'ql-help' }, ` · ${new Date(c.time).toLocaleString()}${target ? ` · on ${target.name || target.kind}` : ''}`)),
         h('div', { style: 'white-space:pre-wrap' }, c.text),
@@ -254,8 +257,8 @@ registerPane({
         reply,
         h('div', { class: 'ql-row' },
           target ? h('button', { class: 'ql-btn ql-sm', onclick: () => app.tab.ui.select([target.id]) }, 'Show') : null,
-          h('button', { class: 'ql-btn ql-sm', onclick: () => app.deck.transact(c.resolved ? 'Reopen Comment' : 'Resolve Comment', () => { const cc = s.comments!.find((x) => x.id === c.id)!; cc.resolved = !cc.resolved || undefined; }, [s.id]) }, c.resolved ? 'Reopen' : 'Resolve'),
-          h('button', { class: 'ql-btn ql-sm', onclick: () => app.deck.transact('Delete Comment', () => { s.comments = s.comments!.filter((x) => x.id !== c.id); }, [s.id]) }, 'Delete'))));
+          h('button', { class: 'ql-btn ql-sm', onclick: () => canEdit(app) && app.deck.transact(c.resolved ? 'Reopen Comment' : 'Resolve Comment', () => { const cc = s.comments!.find((x) => x.id === c.id)!; cc.resolved = !cc.resolved || undefined; }, [s.id]) }, c.resolved ? 'Reopen' : 'Resolve'),
+          h('button', { class: 'ql-btn ql-sm', onclick: () => canEdit(app) && app.deck.transact('Delete Comment', () => { s.comments = s.comments!.filter((x) => x.id !== c.id); }, [s.id]) }, 'Delete'))));
     }
   },
 });
