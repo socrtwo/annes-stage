@@ -28,7 +28,7 @@ import { Deck } from '../../model/deck';
 import type { ShapeElement } from '../../model/types';
 import { scan, identifyAt, recommend, DESCRIPTIONS, type Identification, type Segment, type S2Program } from './fileid';
 import { crc32 } from './inflate';
-import { scanZipBytes, repairXmlPart, stripInvalidChars, balanceXml, isWellFormed, findDamageCut, stringsScan } from './salvage';
+import { scanZipBytes, PACKAGE_OUTPUT_BUDGET, repairXmlPart, stripInvalidChars, balanceXml, isWellFormed, findDamageCut, stringsScan } from './salvage';
 import { importPptxPkg, type Pkg } from '../pptx/import';
 import { importOdpParts, importFodp } from '../odp';
 import { importPpt, salvagePptText } from '../ppt';
@@ -164,21 +164,27 @@ interface Salvage { parts: Pkg; corrupt: Set<string>; salvaged: string[]; zipOk:
 async function salvageZip(u8: Uint8Array, deep: boolean): Promise<Salvage> {
   const s: Salvage = { parts: new Map(), corrupt: new Set(), salvaged: [], zipOk: false, zipError: '' };
   const damaged = new Set<string>();
+  // One output budget for every inflate of this package, so a damaged or hostile archive
+  // cannot expand without bound across its entries.
+  const budget = { remaining: PACKAGE_OUTPUT_BUDGET };
   try {
     const zip = await JSZip.loadAsync(u8);
     s.zipOk = true;
     for (const f of Object.values(zip.files)) {
       if (f.dir) continue;
+      const declared = Number((f as any)._data?.uncompressedSize);
+      if (Number.isFinite(declared) && declared > budget.remaining) { damaged.add(f.name); continue; }
       try {
         const bytes = await f.async('uint8array');
         const want = (f as any)._data?.crc32;
         if (typeof want === 'number' && want !== 0 && crc32(bytes) !== want >>> 0) { damaged.add(f.name); s.corrupt.add(f.name); }
+        budget.remaining = Math.max(0, budget.remaining - bytes.length);
         s.parts.set(f.name, bytes);
       } catch { damaged.add(f.name); }
     }
   } catch (e: any) { s.zipError = e?.message || String(e); }
   if (deep || !s.zipOk || damaged.size) {
-    const scanned = scanZipBytes(u8);
+    const scanned = scanZipBytes(u8, budget);
     for (const [name, e] of scanned) {
       if (!e.isCorrupt && damaged.has(name)) s.corrupt.delete(name);
       if (e.isCorrupt && (!s.parts.has(name) || damaged.has(name))) s.corrupt.add(name);
@@ -354,7 +360,12 @@ async function zipParts(parts: Pkg, mime?: string): Promise<Uint8Array> {
 // ------------------------------------------------------------------------------------------
 // Text scans and media harvest
 
-const unent = (s: string) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_m, d) => String.fromCharCode(+d)).replace(/&#x([0-9a-f]+);/gi, (_m, h) => String.fromCharCode(parseInt(h, 16))).replace(/&amp;/g, '&');
+/** A character for a numeric reference, or '' when the code point is not a valid XML character. */
+const charRef = (cp: number) => {
+  const ok = cp === 9 || cp === 10 || cp === 13 || (cp >= 0x20 && cp <= 0xd7ff) || (cp >= 0xe000 && cp <= 0xfffd) || (cp >= 0x10000 && cp <= 0x10ffff);
+  return ok ? String.fromCodePoint(cp) : '';
+};
+const unent = (s: string) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_m, d) => charRef(parseInt(d, 10))).replace(/&#x([0-9a-f]+);/gi, (_m, h) => charRef(parseInt(h, 16))).replace(/&amp;/g, '&');
 
 /** Text of a slide XML fragment: shapes in order, the title placeholder first. */
 export function scanSlideText(xml: string): OutlineItem | null {
@@ -389,6 +400,46 @@ function scanOdpText(xml: string): OutlineItem[] {
   }).filter((p) => p.title || p.bullets.length);
 }
 
+/**
+ * End (exclusive, after the 0x3B trailer) of a GIF starting at p, found by walking its block
+ * structure: header, logical screen descriptor, global colour table, then extension blocks and
+ * image descriptors (local colour table, LZW minimum code size, data sub-blocks). -1 when the
+ * structure is broken or truncated. Image data can contain 00 3B, so a byte search is not enough.
+ */
+export function gifEnd(u8: Uint8Array, p: number): number {
+  const n = u8.length;
+  if (p + 13 > n || u8[p] !== 0x47 || u8[p + 1] !== 0x49 || u8[p + 2] !== 0x46 || u8[p + 3] !== 0x38 || (u8[p + 4] !== 0x37 && u8[p + 4] !== 0x39) || u8[p + 5] !== 0x61) return -1;
+  let q = p + 13;
+  const lsdFlags = u8[p + 10];
+  if (lsdFlags & 0x80) q += 3 << ((lsdFlags & 7) + 1);
+  const subBlocks = (at: number) => {
+    while (at < n) { const len = u8[at]; at += 1 + len; if (len === 0) return at; }
+    return -1;
+  };
+  let images = 0;
+  while (q < n) {
+    const b = u8[q];
+    if (b === 0x3b) return images ? q + 1 : -1;
+    if (b === 0x21) {
+      if (q + 2 > n) return -1;
+      q = subBlocks(q + 2);
+      if (q < 0) return -1;
+    } else if (b === 0x2c) {
+      if (q + 10 > n) return -1;
+      const f = u8[q + 9];
+      q += 10;
+      if (f & 0x80) q += 3 << ((f & 7) + 1);
+      if (q >= n) return -1;
+      const lzw = u8[q];
+      if (lzw < 1 || lzw > 12) return -1;
+      q = subBlocks(q + 1);
+      if (q < 0) return -1;
+      images++;
+    } else return -1;
+  }
+  return -1;
+}
+
 /** Signature scan for embedded pictures and media in raw bytes. */
 export function harvestMediaBytes(u8: Uint8Array, max = 200): { mime: string; data: Uint8Array }[] {
   const out: { mime: string; data: Uint8Array }[] = [];
@@ -412,8 +463,8 @@ export function harvestMediaBytes(u8: Uint8Array, max = 200): { mime: string; da
   }
   // GIF: to the trailer.
   for (let p = find([0x47, 0x49, 0x46, 0x38], 0); p >= 0 && out.length < max; p = find([0x47, 0x49, 0x46, 0x38], p + 4)) {
-    const e = find([0x00, 0x3b], p + 13);
-    if (e > p) out.push({ mime: 'image/gif', data: u8.slice(p, e + 2) });
+    const e = gifEnd(u8, p);
+    if (e > p) { out.push({ mime: 'image/gif', data: u8.slice(p, e) }); p = e - 4; }
   }
   return out;
 }
@@ -478,7 +529,22 @@ export function deckStats(deck: Deck | null): RecoveryStats {
 
 interface Candidate { id: MethodId; deck: Deck; weight: number }
 
+/** Reports whose repair ran on a piece of a file that starts as a ZIP package. */
+const zipSubRuns = new WeakSet<RecoveryReport>();
+
+const reportScore = (r: RecoveryReport) => (r.deck ? r.stats.slides * 10 + r.stats.shapes + r.stats.pictures * 3 + r.stats.words / 10 : -1);
+
 export async function recoverPresentation(data: Uint8Array | ArrayBuffer, name: string, opts: RecoverOptions = {}): Promise<RecoveryReport> {
+  const raw = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const first = await recoverOnce(raw, name, opts, false);
+  if (!zipSubRuns.has(first)) return first;
+  // The file starts as a ZIP package but repair ran on one piece of it: a signature inside
+  // the archive (stored media, say) may have split it. Repair the whole buffer too, keep the better.
+  const whole = await recoverOnce(raw, name, opts, true);
+  return reportScore(whole) > reportScore(first) ? whole : first;
+}
+
+async function recoverOnce(data: Uint8Array, name: string, opts: RecoverOptions, wholeBuffer: boolean): Promise<RecoveryReport> {
   const progress = (m: string) => { try { opts.onProgress?.(m); } catch { /* UI callback */ } };
   const fileName = name || 'presentation';
   const base = fileName.replace(/\.[^.]+$/, '');
@@ -490,7 +556,7 @@ export async function recoverPresentation(data: Uint8Array | ArrayBuffer, name: 
   const cands: Candidate[] = [];
   const add = (m: MethodResult, id: MethodId, deck: Deck | null, weight: number) => { if (!deck) return; m.slides = deck.slides.length; cands.push({ id, deck, weight }); };
   try {
-    const raw = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const raw = data;
     // ---- a) identify
     progress('Identifying the file…');
     const mId = M('identify');
@@ -499,7 +565,8 @@ export async function recoverPresentation(data: Uint8Array | ArrayBuffer, name: 
     try { segs = scan(raw).segments; } catch { segs = []; }
     let u8: Uint8Array = raw;
     let det = detectKind(raw, fileName);
-    if (segs.length > 1) {
+    if (segs.length > 1 && wholeBuffer) report.notes.push('The file was also repaired as one whole package, ignoring the signatures found inside it.');
+    else if (segs.length > 1) {
       // Several pieces: repair the first one that is a presentation.
       for (const s of segs) {
         const bytes = s.ext === 'ole' || s.ext === 'ppt' ? raw.subarray(s.offset) : s.bytes;
@@ -509,6 +576,7 @@ export async function recoverPresentation(data: Uint8Array | ArrayBuffer, name: 
           det = d; u8 = bytes; break;
         }
       }
+      if (u8.length !== raw.length && segs[0].offset === 0 && raw[0] === 0x50 && raw[1] === 0x4b && raw[2] === 3 && raw[3] === 4) zipSubRuns.add(report);
     }
     report.kind = det.kind;
     report.identification = det.id;

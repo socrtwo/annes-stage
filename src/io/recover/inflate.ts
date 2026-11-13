@@ -36,9 +36,16 @@ export interface InflateOptions {
    * incomplete codes, which compressors of text do not emit but desynchronized decoding does.
    */
   strictBlocks?: boolean;
+  /**
+   * Output budget shared by several inflates (one package, for example). Output stops (marked
+   * corrupt) when it would exceed `remaining`; the caller subtracts what it keeps.
+   */
+  budget?: OutputBudget;
   /** Called at the start of each decoded block (diagnostics). */
   onBlock?: (bitPos: number, outLen: number) => void;
 }
+
+export interface OutputBudget { remaining: number }
 
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -63,6 +70,9 @@ const CLEN_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1
 /** Hard ceiling on output so a damaged stream cannot expand without bound. */
 const MAX_OUT = 256 * 1024 * 1024;
 
+class Corrupt extends Error {}
+
+/** Canonical Huffman table; null for an all-zero code. Throws Corrupt for an over-subscribed code. */
 function build(lengths: ArrayLike<number>, n: number): Huffman | null {
   const count = new Uint16Array(16);
   const symbol = new Uint16Array(n);
@@ -70,7 +80,7 @@ function build(lengths: ArrayLike<number>, n: number): Huffman | null {
   for (let s = 0; s < n; s++) count[lengths[s] & 15]++;
   if (count[0] === n) return null;
   let left = 1;
-  for (let len = 1; len < 16; len++) { left = (left << 1) - count[len]; if (left < 0) break; }
+  for (let len = 1; len < 16; len++) { left = (left << 1) - count[len]; if (left < 0) throw new Corrupt(); }
   for (let len = 1; len < 15; len++) offs[len + 1] = offs[len] + count[len];
   for (let s = 0; s < n; s++) if (lengths[s]) symbol[offs[lengths[s] & 15]++] = s;
   return { count, symbol, complete: left === 0 };
@@ -82,8 +92,6 @@ const FIXED_LIT = (() => {
   return build(l, 288)!;
 })();
 const FIXED_DIST = build(new Uint8Array(30).fill(5), 30)!;
-
-class Corrupt extends Error {}
 
 class Bits {
   pos: number; buf = 0; cnt = 0;
@@ -124,13 +132,17 @@ class Out {
   windowStart = 0;
   /** True once a resync has dropped data: references before windowStart become placeholders. */
   lossy = false;
-  constructor(public placeholder: number, initial: number) { this.data = new Uint8Array(Math.max(1024, Math.min(initial, 1 << 24))); }
+  limit: number;
+  constructor(public placeholder: number, initial: number, limit = MAX_OUT) {
+    this.limit = Math.max(0, Math.min(MAX_OUT, limit));
+    this.data = new Uint8Array(Math.max(1024, Math.min(initial, 1 << 24, Math.max(this.limit, 1024))));
+  }
   need(n: number): void {
+    if (this.len + n > this.limit) throw new Corrupt();
     if (this.len + n <= this.data.length) return;
-    if (this.len + n > MAX_OUT) throw new Corrupt();
     let size = this.data.length * 2;
     while (size < this.len + n) size *= 2;
-    const next = new Uint8Array(Math.min(size, MAX_OUT));
+    const next = new Uint8Array(Math.min(size, this.limit));
     next.set(this.data.subarray(0, this.len));
     this.data = next;
   }
@@ -145,6 +157,9 @@ function block(s: Bits, o: Out, strict: boolean): number {
     s.align();
     if (s.pos + 4 > s.src.length) throw new Corrupt();
     const n = s.src[s.pos] | (s.src[s.pos + 1] << 8);
+    const nn = s.src[s.pos + 2] | (s.src[s.pos + 3] << 8);
+    // LEN must be the one's complement of NLEN; otherwise this is not a stored block.
+    if ((n ^ 0xffff) !== nn) throw new Corrupt();
     s.pos += 4;
     const avail = Math.min(n, s.src.length - s.pos);
     o.need(avail);
@@ -225,7 +240,7 @@ function looksLikeText(u8: Uint8Array, from: number, to: number): boolean {
 }
 
 export function immortalInflate(input: Uint8Array, opts: InflateOptions = {}): InflateResult {
-  const o = new Out(opts.placeholder ?? 0x20, input.length * 4);
+  const o = new Out(opts.placeholder ?? 0x20, input.length * 4, opts.budget ? opts.budget.remaining : MAX_OUT);
   let s = new Bits(input);
   let corrupted = false, gaps = 0;
   const totalBits = input.length * 8;

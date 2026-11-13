@@ -224,8 +224,19 @@ export interface Segment extends Identification {
   handledHere?: boolean; suggestedName?: string; recommended?: S2Program[];
 }
 
+/** Offset of the last ZIP structure signature (local header, central directory, EOCD) in b, or -1. */
+function lastZipStructure(b: Uint8Array): number {
+  for (let i = b.length - 4; i >= 0; i--) {
+    if (b[i] !== 0x50 || b[i + 1] !== 0x4b) continue;
+    const c = b[i + 2], d = b[i + 3];
+    if ((c === 3 && d === 4) || (c === 1 && d === 2) || (c === 5 && d === 6)) return i;
+  }
+  return -1;
+}
+
 export function scan(b: Uint8Array): { segments: Segment[]; multiple: boolean } {
   const starts = [0];
+  let lastZip = -2;
   let cur = segState(b, 0);
   let pos = Math.max(1, cur.guard);
   while (pos < b.length) {
@@ -233,7 +244,17 @@ export function scan(b: Uint8Array): { segments: Segment[]; multiple: boolean } 
     for (const s of BOUNDARY_SIGS) if (matches(b, pos, s.sig)) { hit = s; break; }
     if (hit) {
       let accept = true;
-      if (cur.kind === 'zip') accept = hit.ext === 'zip' ? !!cur.walkClean : !!cur.walkClean || hit.sig.length >= 5;
+      if (cur.kind === 'zip') {
+        // A clean walk ends at the EOCD, so anything after it is a separate piece. When the walk
+        // is not clean, the pieces of the archive (stored PNG/GIF/PDF/OLE media) still carry their
+        // own signatures: never split there while ZIP structures follow, only after the last one.
+        if (cur.walkClean) accept = true;
+        else if (hit.ext === 'zip') accept = false;
+        else {
+          if (lastZip === -2) lastZip = lastZipStructure(b);
+          accept = pos > lastZip && hit.sig.length >= 5;
+        }
+      }
       else if (cur.kind === 'ole') accept = (pos - cur.start) % 512 === 0 || hit.sig.length >= 6;
       else if (cur.kind === 'jpg' && hit.ext === 'jpg') accept = indexOfBytes(b, [0xff, 0xd9], cur.start, pos) !== -1;
       if (accept) { starts.push(pos); cur = segState(b, pos); pos = Math.max(pos + 1, cur.guard); continue; }

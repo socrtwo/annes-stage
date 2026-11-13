@@ -14,7 +14,7 @@
  * consistent, and balanceXml() rebuilds a well-formed tree from tag soup (mis-nested and
  * truncated elements, stray ampersands, duplicate attributes, undeclared prefixes).
  */
-import { immortalInflate, crc32, type InflateResult } from './inflate';
+import { immortalInflate, crc32, type InflateResult, type OutputBudget } from './inflate';
 
 export interface SalvagedEntry {
   data: Uint8Array;
@@ -43,8 +43,47 @@ function isSig(b: Uint8Array, k: number): boolean {
   return (c === 1 && d === 2) || (c === 3 && d === 4) || (c === 5 && d === 6) || (c === 7 && d === 8) || (c === 6 && d === 6) || (c === 6 && d === 7);
 }
 
+/** Default total output budget for one package's inflates. */
+export const PACKAGE_OUTPUT_BUDGET = 512 * 1024 * 1024;
+
+/** Output of shift 0 at least this long is kept without trying bit-alignment shifts. */
+const SUBSTANTIAL = 4096;
+
+/**
+ * Inflate one entry's raw data. Shift 0 (the data where the header says it starts) is the
+ * genuine stream, so its partial decode is kept unless it failed in its very first block and
+ * produced almost nothing. Only then are bit-alignment shifts 1..47 tried, ranked by complete
+ * blocks and output length rather than by printable bytes (binary parts are not text).
+ */
+function inflateEntry(raw: Uint8Array, name: string, budget: OutputBudget): { best: InflateResult; shift: number } {
+  const run = (src: Uint8Array) => {
+    let blocks = 0;
+    const r = immortalInflate(src, { budget, onBlock: () => { blocks++; } });
+    // Blocks that decoded completely: the last started block failed when the result is corrupt.
+    return { r, good: r.isCorrupt ? blocks - 1 : blocks };
+  };
+  const first = run(raw);
+  if (!first.r.isCorrupt || first.good > 0 || first.r.data.length >= SUBSTANTIAL) return { best: first.r, shift: 0 };
+  const isXml = /\.(xml|rels)$/i.test(name);
+  const score = (x: { r: InflateResult; good: number }) => {
+    if (!x.r.data.length) return 0;
+    const head = x.r.data.subarray(0, 100);
+    const xmlBonus = isXml && head.includes(60) ? 1 : 0;
+    return (x.r.isCorrupt ? 0 : 1e12) + x.good * 1e7 + xmlBonus * 1e6 + x.r.data.length;
+  };
+  let best = first, bestScore = score(first), bestShift = 0;
+  for (let shift = 1; shift < 48 && shift < raw.length; shift++) {
+    const c = run(raw.subarray(shift));
+    const sc = score(c);
+    // A shifted decode must do clearly better than the genuine one to replace it.
+    if (sc > bestScore && (c.good > first.good || c.r.data.length > Math.max(64, first.r.data.length * 2))) { best = c; bestScore = sc; bestShift = shift; }
+    if (!best.r.isCorrupt || best.r.data.length >= SUBSTANTIAL) break;
+  }
+  return { best: best.r, shift: bestShift };
+}
+
 /** Byte-level ZIP recovery: every entry whose local header survives. */
-export function scanZipBytes(u8: Uint8Array): Map<string, SalvagedEntry> {
+export function scanZipBytes(u8: Uint8Array, budget: OutputBudget = { remaining: PACKAGE_OUTPUT_BUDGET }): Map<string, SalvagedEntry> {
   const out = new Map<string, SalvagedEntry>();
   const dec = new TextDecoder('utf-8', { fatal: false });
   let offset = 0;
@@ -71,25 +110,27 @@ export function scanZipBytes(u8: Uint8Array): Map<string, SalvagedEntry> {
       for (let k = dStart; k < u8.length - 4; k++) if (isSig(u8, k)) { next = k; break; }
     }
     const raw = u8.subarray(dStart, next);
+    // The CRC: from the local header, or from the data descriptor that follows the data (flag 0x08).
+    let want: number | null = crc || null;
+    if (flags & 0x08) {
+      want = null;
+      if (next + 8 <= u8.length && u8[next] === 0x50 && u8[next + 1] === 0x4b && u8[next + 2] === 7 && u8[next + 3] === 8) want = u32(u8, next + 4);
+    }
     let data: Uint8Array | null = null, isCorrupt = false;
-    if (meth === 0) data = raw;
-    else {
-      let best: InflateResult = { data: new Uint8Array(0), isCorrupt: true }, bestScore = 0, bestShift = 0;
-      for (let shift = 0; shift < 48 && shift < raw.length; shift++) {
-        const r = immortalInflate(raw.subarray(shift));
-        if (!r.data.length) continue;
-        if (shift === 0 && !r.isCorrupt) { best = r; break; }
-        const score = rateQuality(r.data, name) + (r.isCorrupt ? 0 : 100);
-        if (score > bestScore) { bestScore = score; best = r; bestShift = shift; if (score > 1000) break; }
-      }
-      // Damaged data often inflates without an error, so check the CRC from the local header.
-      if (!best.isCorrupt && crc && !(flags & 0x08) && crc32(best.data) !== crc) best = { ...best, isCorrupt: true };
+    if (meth === 0) {
+      data = raw;
+      if (want != null && crc32(raw) !== want) isCorrupt = true;
+    } else {
+      let { best, shift: bestShift } = inflateEntry(raw, name, budget);
+      // Damaged data often inflates without an error, so check the CRC.
+      if (!best.isCorrupt && want != null && crc32(best.data) !== want) best = { ...best, isCorrupt: true };
       // A damaged XML stream: skip the bad region and keep decoding the deflate blocks after it.
       if (best.isCorrupt && /\.(xml|rels)$/i.test(name)) {
-        const r = immortalInflate(raw.subarray(bestShift), { resync: true, validateText: true, strictBlocks: true });
+        const r = immortalInflate(raw.subarray(bestShift), { resync: true, validateText: true, strictBlocks: true, budget });
         if (r.data.length > best.data.length * 0.5 || r.gaps) best = { ...r, isCorrupt: true };
       }
       data = best.data; isCorrupt = best.isCorrupt;
+      budget.remaining = Math.max(0, budget.remaining - data.length);
     }
     if (data && data.length) {
       const prev = out.get(name);
