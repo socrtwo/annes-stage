@@ -73,17 +73,28 @@ export function resolveColor(c: Color | undefined, ctx: ColorContext, fallback =
   if (c == null) return { hex: fallback, alpha: 1 };
   if (typeof c === 'string') return { hex: schemeHex(c, ctx) || fallback, alpha: 1 };
   let hex = schemeHex(c.s, ctx) || fallback;
-  if (c.lum) hex = adjustLum(hex, c.lum);
-  return { hex, alpha: c.alpha ?? 1 };
+  if (c.lum && Number.isFinite(+c.lum)) hex = adjustLum(hex, +c.lum);
+  const a = Number(c.alpha ?? 1);
+  return { hex, alpha: Number.isFinite(a) ? Math.max(0, Math.min(1, a)) : 1 };
+}
+
+/** Only '#RGB' to '#RRGGBBAA' hex colors are accepted from data (they are interpolated into markup). */
+export const HEX_RE = /^#[0-9a-f]{3,8}$/i;
+export function safeHex(v: unknown): string | null {
+  return typeof v === 'string' && HEX_RE.test(v.trim()) ? v.trim().toUpperCase() : null;
 }
 
 function schemeHex(name: string, ctx: ColorContext): string | null {
-  if (name.startsWith('#')) return name.length === 7 || name.length === 4 ? name.toUpperCase() : null;
-  if (name === 'phClr') return ctx.phClr || null;
+  if (typeof name !== 'string') return null;
+  if (name.startsWith('#')) return name.length === 7 || name.length === 4 ? safeHex(name) : null;
+  if (name === 'phClr') return safeHex(ctx.phClr);
   let key = name;
   if (ALIAS[key]) key = (ctx.master?.clrMap as any)?.[key] || ALIAS[key];
+  if (!Object.prototype.hasOwnProperty.call(ctx.theme.colors || {}, key)) return null;
   const v = (ctx.theme.colors as any)[key];
-  return v || null;
+  const hex = safeHex(v);
+  // Theme values without '#' (older files) are accepted when they are plain hex.
+  return hex || (typeof v === 'string' && /^[0-9a-f]{6}$/i.test(v) ? `#${v.toUpperCase()}` : null);
 }
 
 /** CSS rgba() or hex for a resolved color. */

@@ -2,7 +2,7 @@
 .qs-show { position: fixed; inset: 0; z-index: 2000; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; outline: none; user-select: none; -webkit-user-select: none; touch-action: none; }
 .qs-stage { position: relative; width: min(100vw, calc(100vh * var(--qs-ratio, 1.7778))); aspect-ratio: var(--qs-ratio, 1.7778); overflow: hidden; transition: transform .35s ease; }
 .qs-layer { position: absolute; inset: 0; transform-style: preserve-3d; }
-.qs-layer > svg, .qs-pv-slide > svg, .qs-audience > svg { display: block; width: 100%; height: 100%; }
+.qs-layer > svg, .qs-pv-slide > svg, .qs-audience > div > svg { display: block; width: 100%; height: 100%; }
 .qs-ink { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 3; }
 .qs-media { position: absolute; z-index: 2; object-fit: contain; background: #000; }
 .qs-laser { display: none; position: absolute; z-index: 4; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; box-shadow: 0 0 10px 4px currentColor, 0 0 3px 1px #fff8; color: #FF1744; pointer-events: none; }

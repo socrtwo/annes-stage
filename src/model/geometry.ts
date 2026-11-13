@@ -164,7 +164,7 @@ export function geometryPath(geom: string, w: number, h: number, adj?: Record<st
   if (geom === 'custom' && custom?.length) {
     // Scale each custom path from its own coordinate space to the box.
     const d = custom.map((p) => scalePath(p.d, p.w ? w / p.w : 1, p.h ? h / p.h : 1)).join(' ');
-    return { d, open: !/[Zz]\s*$/.test(custom[custom.length - 1].d.trim()) };
+    return { d, open: !/[Zz]\s*$/.test(String(custom[custom.length - 1].d ?? '').trim()) };
   }
   const def = GEOMETRY[geom] || GEOMETRY.rect;
   const a = { ...(def.adj || {}), ...(adj || {}) };
@@ -180,7 +180,9 @@ export function textRect(geom: string, w: number, h: number): [number, number, n
 
 /** Scales an absolute SVG path (M, L, H, V, C, Q, A, Z commands). */
 export function scalePath(d: string, sx: number, sy: number): string {
-  if (sx === 1 && sy === 1) return d;
+  if (typeof d !== 'string') return '';
+  // Path data comes from files and is interpolated into markup: keep only path-data characters.
+  if (sx === 1 && sy === 1) return d.replace(/[^MmLlHhVvCcSsQqTtAaZz0-9.,eE+\-\s]/g, '');
   const tokens = d.match(/[a-zA-Z]|-?\d*\.?\d+(?:e[-+]?\d+)?/g) || [];
   let out = '';
   let cmd = '';

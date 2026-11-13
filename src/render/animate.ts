@@ -141,7 +141,7 @@ export function buildSteps(slide: Slide): BuildStep[] {
 export function clickCount(slide: Slide): number { return buildSteps(slide).length - 1; }
 
 /** Visibility of elements and paragraphs after the first n steps have played. */
-export function stateAt(slide: Slide, n: number, steps = buildSteps(slide)): BuildState {
+export function stateAt(slide: Slide, n: number, steps = buildSteps(slide), o: { live?: boolean } = {}): BuildState {
   const hide = new Set<string>();
   const paraVisible = new Map<string, Set<number>>();
   const all = steps.flatMap((s) => s.effects);
@@ -160,6 +160,14 @@ export function stateAt(slide: Slide, n: number, steps = buildSteps(slide)): Bui
     if (seen.has(a.target)) continue;
     seen.add(a.target);
     if (a.cls === 'entr') hide.add(a.target);
+  }
+  // Entrances started by clicking a shape (not part of the build steps) start hidden too: always in
+  // a live show, and in static renders until the slide is fully built (print shows every object).
+  if (o.live || n < steps.length) for (const a of slide.anims || []) {
+    if (!a.onShape || seen.has(a.target)) continue;
+    if (a.cls !== 'entr' && a.cls !== 'exit') continue;
+    seen.add(a.target);
+    if (a.cls === 'entr' && !paraVisible.has(a.target)) hide.add(a.target);
   }
   for (let i = 0; i < Math.min(n, steps.length); i++) {
     for (const e of [...steps[i].effects].sort((x, y) => x.start + x.dur - (y.start + y.dur))) applyEffect(e, hide, paraVisible);
@@ -191,7 +199,32 @@ const SVGNS = 'http://www.w3.org/2000/svg';
 
 function parseSvg(markup: string): SVGSVGElement {
   const doc = new DOMParser().parseFromString(markup, 'image/svg+xml');
+  // An XML error yields a <parsererror> document (a blank slide); fall back to the forgiving HTML parser.
+  if (doc.documentElement.nodeName !== 'svg' || doc.getElementsByTagName('parsererror').length) {
+    const t = document.createElement('template');
+    t.innerHTML = markup;
+    const el = t.content.querySelector('svg');
+    if (el) return document.importNode(el, true) as unknown as SVGSVGElement;
+  }
   return document.importNode(doc.documentElement, true) as unknown as SVGSVGElement;
+}
+
+/**
+ * Ids of the slide's elements to hide so only `id` is drawn: top-level elements that neither are nor
+ * contain it, plus the siblings of `id` (and of its ancestors) inside the groups that contain it.
+ */
+export function idsExcept(els: ModelElement[], id: string): Set<string> {
+  const out = new Set<string>();
+  const contains = (e: ModelElement): boolean => e.id === id || (e.kind === 'group' && e.children.some(contains));
+  const walk = (list: ModelElement[]) => {
+    for (const e of list) {
+      if (e.id === id) continue;
+      if (e.kind === 'group' && contains(e)) walk(e.children);
+      else out.add(e.id);
+    }
+  };
+  walk(els);
+  return out;
 }
 
 /**
@@ -213,7 +246,7 @@ export function renderAnimatedSlide(deck: Deck, slide: Slide, n: number, opts: R
     const count = paraCount(slide, id);
     let after: Element | ChildNode = el;
     for (let p = 0; p < count; p++) {
-      const others = new Set(slide.elements.map((e) => e.id).filter((x) => x !== id));
+      const others = idsExcept(slide.elements, id);
       const layerSvg = parseSvg(slideSvg(deck, slide, { ...opts, mode: 'show', ids: true, hide: others, paraVisible: new Map([[id, new Set([p])]]), ink: false }));
       const g = layerSvg.querySelector(`g[data-id="${cssEsc(id)}"]`);
       if (!g) continue;
@@ -226,7 +259,7 @@ export function renderAnimatedSlide(deck: Deck, slide: Slide, n: number, opts: R
     }
   }
   wrapAnimatable(svg);
-  applyState(svg, stateAt(slide, n, steps));
+  applyState(svg, stateAt(slide, n, steps, { live: true }));
   return svg;
 }
 

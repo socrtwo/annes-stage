@@ -7,7 +7,24 @@
  * needs inverse logic. Media are append-only during a session and are not part of the images.
  */
 import type { DeckData, Element, Layout, Master, MediaItem, Paragraph, PlaceholderType, Slide, Theme, LevelStyle, TextBody, Section } from './types';
-import { defaultTheme } from './theme';
+import { defaultTheme, safeHex } from './theme';
+
+const urlCache = new WeakMap<object, string>();
+const MIME_RE = /^[\w.+-]+\/[\w.+-]+$/;
+const B64_RE = /^[A-Za-z0-9+/\s]*={0,2}\s*$/;
+
+/** A media item is kept only when its type is a plain MIME type and its data is base64. */
+export function validMedia(m: any): m is MediaItem {
+  return !!m && typeof m === 'object' && typeof m.mime === 'string' && MIME_RE.test(m.mime) && typeof m.b64 === 'string' && B64_RE.test(m.b64);
+}
+
+/** Media from a file, without entries whose type or data could break out of a data: URL. */
+export function sanitizeMedia(media: any): Record<string, MediaItem> {
+  const out: Record<string, MediaItem> = {};
+  if (!media || typeof media !== 'object') return out;
+  for (const [k, v] of Object.entries(media)) if (validMedia(v)) out[k] = v;
+  return out;
+}
 
 let seq = 0;
 export function newId(prefix = 'e'): string {
@@ -192,8 +209,14 @@ export class Deck {
   }
 
   mediaUrl(id: string): string {
-    const m = this.media[id];
-    return m ? `data:${m.mime};base64,${m.b64}` : '';
+    const m = Object.prototype.hasOwnProperty.call(this.media, id) ? this.media[id] : undefined;
+    if (!m || typeof m !== 'object') return '';
+    let url = urlCache.get(m);
+    if (url === undefined) {
+      url = validMedia(m) ? `data:${m.mime};base64,${/\s/.test(m.b64) ? m.b64.replace(/\s+/g, '') : m.b64}` : '';
+      urlCache.set(m, url);
+    }
+    return url;
   }
 
   // ------------------------------------------------------------------------------------------
@@ -294,7 +317,7 @@ export class Deck {
   static fromJSON(j: any): Deck {
     if (!j || typeof j !== 'object' || !j.data || !Array.isArray(j.data.slides)) throw new Error('Not an Anne\'s Stage presentation');
     const d = new Deck(normalizeData(j.data));
-    d.media = j.media && typeof j.media === 'object' ? j.media : {};
+    d.media = sanitizeMedia(j.media);
     return d;
   }
 }
@@ -313,6 +336,18 @@ export function normalizeData(d: any): DeckData {
     props: d.props || {},
     show: d.show || {},
   };
+  for (const t of out.themes) {
+    if (!t || typeof t !== 'object') continue;
+    const colors: any = t.colors && typeof t.colors === 'object' ? t.colors : {};
+    const def: any = base.themes[0].colors;
+    const clean: any = {};
+    for (const [k, v] of Object.entries(colors)) {
+      const hex = safeHex(v) || (typeof v === 'string' && /^[0-9a-f]{6}$/i.test(v) ? `#${v.toUpperCase()}` : null);
+      clean[k] = hex || def[k] || '#000000';
+    }
+    t.colors = clean;
+    if (!t.fonts || typeof t.fonts !== 'object') t.fonts = { ...base.themes[0].fonts };
+  }
   for (const m of out.masters) { if (!m.styles) m.styles = defaultStyles(); if (!m.elements) m.elements = []; }
   if (!Array.isArray(d.layouts) || !d.layouts.length) for (const l of out.layouts) l.master = out.masters[0].id;
   for (const s of out.slides) {

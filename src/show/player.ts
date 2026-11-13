@@ -39,6 +39,8 @@ export interface ShowController {
   next(): void;
   prev(): void;
   goto(index: number): void;
+  /** Goes to a position in the show's order (custom shows can play a slide more than once). */
+  gotoPos(pos: number): void;
   end(): void;
   black(): void;
   white(): void;
@@ -49,6 +51,8 @@ export interface ShowController {
   readonly stepCount: number;
   /** The slides this show plays, in order (deck indexes). */
   readonly order: number[];
+  /** Position of the current slide in order. */
+  readonly pos: number;
   readonly screen: 'normal' | 'black' | 'white';
   readonly tool: Tool;
   setTool(t: Tool): void;
@@ -115,6 +119,8 @@ class Show implements ShowController {
   private busy = false;
   private atEnd = false;
   private numBuf = '';
+  /** Detaches the listeners of a pen stroke in progress. */
+  private drawCleanup: (() => void) | null = null;
   private autoTimer: any = null;
   private paused = false;
   private inkVisible = true;
@@ -212,6 +218,12 @@ class Show implements ShowController {
     if (!this.opts.noFullscreen) {
       try { const p = this.root.requestFullscreen?.(); if (p) p.catch(() => undefined); } catch { /* not allowed */ }
     }
+    // Leaving full screen with the browser's own Esc (which never reaches onKey) ends the show.
+    let wasFull = false;
+    this.listen(this.doc, 'fullscreenchange', () => {
+      if (this.doc.fullscreenElement) { wasFull = true; return; }
+      if (wasFull && !this.ended) this.end();
+    });
     this.root.focus();
     this.listen(this.doc, 'keydown', (e) => this.onKey(e as KeyboardEvent), true);
     for (const kw of this.opts.keyWindows || []) if (kw !== this.win) this.listen(kw.document, 'keydown', (e) => this.onKey(e as KeyboardEvent), true);
@@ -284,7 +296,12 @@ class Show implements ShowController {
     this.recordRehearsal();
     this.clearAuto();
     this.stopMedia();
-    this.atEnd = false;
+    if (this.atEnd) {
+      this.atEnd = false;
+      this.screenEl.className = 'qs-screen' + (this.screen === 'normal' ? '' : ` qs-on qs-${this.screen}`);
+      this.screenEl.textContent = '';
+      this.screenEl.onclick = null;
+    }
     const prevSlide = this.slide;
     this.pos = Math.max(0, Math.min(this.order.length - 1, p));
     const slide = this.slide;
@@ -300,6 +317,8 @@ class Show implements ShowController {
     this.layer = layer;
     this.drawInk();
     this.updateCounter();
+    // Listeners read step on 'slide', so it must already describe the new slide.
+    this.step = startStep;
     this.emit('slide', this.index, this.pos);
     this.busy = true;
     try {
@@ -378,7 +397,10 @@ class Show implements ShowController {
   }
 
   goto(index: number): void {
-    let p = this.order.indexOf(index);
+    // A slide can appear more than once in a custom show: prefer the next occurrence from here.
+    let p = -1;
+    for (let k = 0; k < this.order.length && p < 0; k++) { const q = (this.pos + 1 + k) % this.order.length; if (this.order[q] === index) p = q; }
+    if (this.order[this.pos] === index && p !== this.pos) p = this.pos;
     if (p < 0) {
       // A slide outside the custom show or range: play it anyway (hidden slides are reachable this way).
       if (index < 0 || index >= this.deck.slides.length) return;
@@ -389,6 +411,12 @@ class Show implements ShowController {
     void this.show(p);
   }
 
+  gotoPos(pos: number): void {
+    if (this.ended || pos < 0 || pos >= this.order.length) return;
+    this.setScreen('normal');
+    void this.show(pos);
+  }
+
   private endScreen(): void {
     this.atEnd = true;
     this.clearAuto();
@@ -397,12 +425,17 @@ class Show implements ShowController {
     this.screenEl.onclick = () => this.end();
   }
 
-  black(): void { this.setScreen(this.screen === 'black' ? 'normal' : 'black'); }
-  white(): void { this.setScreen(this.screen === 'white' ? 'normal' : 'white'); }
+  // The end screen is already black; blanking it would hide the "click to exit" prompt.
+  black(): void { if (this.atEnd) return; this.setScreen(this.screen === 'black' ? 'normal' : 'black'); }
+  white(): void { if (this.atEnd) return; this.setScreen(this.screen === 'white' ? 'normal' : 'white'); }
 
   private setScreen(s: 'normal' | 'black' | 'white'): void {
     if (this.atEnd && s === 'normal') return;
+    const was = this.screen;
     this.screen = s;
+    // A blank screen pauses automatic advance; returning resumes it.
+    if (s !== 'normal') this.clearAuto();
+    else if (was !== 'normal' && !this.busy) this.scheduleAuto();
     this.screenEl.onclick = null;
     this.screenEl.textContent = '';
     this.screenEl.className = 'qs-screen' + (s === 'normal' ? '' : ` qs-on qs-${s}`);
@@ -458,6 +491,8 @@ class Show implements ShowController {
     const k = e.key;
     const ctrl = e.ctrlKey || e.metaKey;
     let handled = true;
+    // Any other key (but a bare modifier) abandons a slide number being typed.
+    if (this.numBuf && !(/^\d$/.test(k) && !ctrl) && k !== 'Enter' && !['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock'].includes(k)) this.numBuf = '';
     if (/^\d$/.test(k) && !ctrl) { this.numBuf += k; toastIn(this.doc, `Go to slide ${this.numBuf}…`); }
     else if (k === 'Enter' && this.numBuf) { const n = parseInt(this.numBuf, 10) - 1; this.numBuf = ''; this.goto(n); }
     else if (ctrl && (k === 'p' || k === 'P')) this.setTool('pen');
@@ -471,8 +506,8 @@ class Show implements ShowController {
     else if (this.kiosk && !['Escape', 'Home', 'End'].includes(k)) handled = false;
     else if (['ArrowRight', 'ArrowDown', ' ', 'n', 'N', 'Enter', 'PageDown'].includes(k)) this.next();
     else if (['ArrowLeft', 'ArrowUp', 'Backspace', 'p', 'P', 'PageUp'].includes(k)) this.prev();
-    else if (k === 'Home') this.goto(this.order[0]);
-    else if (k === 'End') this.goto(this.order[this.order.length - 1]);
+    else if (k === 'Home') this.gotoPos(0);
+    else if (k === 'End') this.gotoPos(this.order.length - 1);
     else if (k === 'b' || k === 'B' || k === '.') this.black();
     else if (k === 'w' || k === 'W' || k === ',') this.white();
     else if (k === 'g' || k === 'G' || k === '-') this.overview();
@@ -536,8 +571,8 @@ class Show implements ShowController {
     if (!l) return false;
     if (l.action === 'next') this.next();
     else if (l.action === 'prev') this.prev();
-    else if (l.action === 'first') this.goto(this.order[0]);
-    else if (l.action === 'last') this.goto(this.order[this.order.length - 1]);
+    else if (l.action === 'first') this.gotoPos(0);
+    else if (l.action === 'last') this.gotoPos(this.order.length - 1);
     else if (l.action === 'end') this.end();
     else if (l.slide) { const i = this.deck.slideIndex(l.slide); if (i >= 0) this.goto(i); }
     else if (l.url) this.app.followLink(l.url);
@@ -612,14 +647,23 @@ class Show implements ShowController {
     this.inkSvg.appendChild(path);
     const d = () => 'M' + pts.map((p) => `${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' L');
     const move = (ev: Event) => { const pe = ev as PointerEvent; pts.push(this.toSlide(pe.clientX, pe.clientY)); path.setAttribute('d', d()); };
-    const up = () => {
+    const slideId = this.slide.id;
+    const detach = () => {
       this.doc.removeEventListener('pointermove', move);
       this.doc.removeEventListener('pointerup', up);
+      this.doc.removeEventListener('pointercancel', up);
+      if (this.drawCleanup === detach) this.drawCleanup = null;
       path.remove();
-      if (pts.length > 1) this.addInk(this.slide!.id, { d: d(), color, width, highlighter: hl });
     };
+    const up = () => {
+      detach();
+      if (pts.length > 1 && !this.ended) this.addInk(slideId, { d: d(), color, width, highlighter: hl });
+    };
+    this.drawCleanup?.();
+    this.drawCleanup = detach;
     this.doc.addEventListener('pointermove', move);
     this.doc.addEventListener('pointerup', up);
+    this.doc.addEventListener('pointercancel', up);
   }
 
   private eraseAt(e: PointerEvent): void {
@@ -795,6 +839,7 @@ class Show implements ShowController {
     if (this.recog) { try { this.recog.stop(); } catch { /* */ } this.recog = null; }
     for (const c of this.cleanups) c();
     this.cleanups = [];
+    this.drawCleanup?.();
     try { if (this.doc.fullscreenElement) void this.doc.exitFullscreen().catch(() => undefined); } catch { /* */ }
     this.root.remove();
     void keepAwake(false);

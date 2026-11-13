@@ -166,7 +166,7 @@ class PresenterView {
     this.inkSvg.addEventListener('pointermove', (e) => { if (show.tool === 'laser') { const p = this.toSlide(e); show.laser(p.x, p.y); } });
     this.inkSvg.addEventListener('pointerleave', () => { if (show.tool === 'laser') show.laser(null); });
     try { this.channel = new BroadcastChannel(SHOW_CHANNEL); } catch { this.channel = null; }
-    this.offs.push(show.on('slide', () => this.render()), show.on('step', () => this.render()), show.on('ink', () => this.drawInk()),
+    this.offs.push(show.on('slide', () => this.render()), show.on('step', () => this.render()), show.on('ink', () => { this.drawInk(); this.broadcast(); }),
       show.on('tool', (t: Tool) => this.syncTool(t)), show.on('screen', () => this.render()), show.on('end', () => this.close()));
     this.tick = setInterval(() => this.drawTimer(), 500);
     if (audience) {
@@ -218,7 +218,7 @@ class PresenterView {
     const slide = deck.slides[show.index];
     if (!slide) return;
     const num = (i: number) => i + (deck.data.firstNumber ?? 1);
-    const st = stateAt(slide, show.step);
+    const st = stateAt(slide, show.step, undefined, { live: true });
     this.cur.innerHTML = slideSvg(deck, slide, { mode: 'show', hide: st.hide, paraVisible: st.paraVisible, number: num(show.index), ink: false });
     this.cur.appendChild(this.inkSvg);
     this.drawInk();
@@ -226,12 +226,12 @@ class PresenterView {
     let next: { slide: Slide; step: number; label: string } | null = null;
     if (show.step < show.stepCount) next = { slide, step: show.step + 1, label: 'Next animation' };
     else {
-      const p = show.order.indexOf(show.index);
+      const p = show.pos;
       for (let q = p + 1; q < show.order.length; q++) { const s = deck.slides[show.order[q]]; if (s && !s.hidden) { next = { slide: s, step: 1, label: 'Next slide' }; break; } }
     }
     const label = this.root.querySelector('.qs-pv-next-label');
     if (next) {
-      const ns = stateAt(next.slide, next.step);
+      const ns = stateAt(next.slide, next.step, undefined, { live: true });
       this.nextEl.innerHTML = slideSvg(deck, next.slide, { mode: 'show', hide: ns.hide, paraVisible: ns.paraVisible, number: num(deck.slideIndex(next.slide.id)) });
       if (label) label.textContent = next.label;
     } else {
@@ -242,7 +242,7 @@ class PresenterView {
     const notes = slide.notes.map((p) => p.runs.map((r) => r.text).join(''));
     if (!notes.join('').trim()) this.notes.appendChild(Object.assign(document.createElement('p'), { textContent: 'No notes.' }));
     else for (const t of notes) { const p = document.createElement('p'); p.textContent = t || ' '; this.notes.appendChild(p); }
-    const pos = show.order.indexOf(show.index);
+    const pos = show.pos;
     this.countEl.textContent = `Slide ${pos + 1} of ${show.order.length}${show.screen !== 'normal' ? ` · ${show.screen} screen` : ''}`;
     this.broadcast();
   }
@@ -264,7 +264,7 @@ class PresenterView {
     const deck = this.app.deck;
     const slide = deck.slides[this.show.index];
     if (!slide) return;
-    const st = stateAt(slide, this.show.step);
+    const st = stateAt(slide, this.show.step, undefined, { live: true });
     const ink: InkStroke[] = this.show.inkFor(slide.id);
     try {
       this.channel.postMessage({ type: 'frame', ratio: deck.size.w / deck.size.h, screen: this.show.screen, svg: slideSvg(deck, slide, { mode: 'show', hide: st.hide, paraVisible: st.paraVisible, number: this.show.index + (deck.data.firstNumber ?? 1) }), ink });
@@ -354,8 +354,27 @@ export function followBroadcast(root: HTMLElement): () => void {
     // The markup comes from Anne's Stage's own renderer in a same-origin window; parse it as SVG
     // (scripts in SVG parsed this way do not run) and drop anything that is not drawing.
     const doc = new DOMParser().parseFromString(m.svg, 'image/svg+xml');
+    // A malformed frame (parser error document) keeps the previous frame instead of blanking it.
+    if (doc.documentElement.nodeName !== 'svg' || doc.getElementsByTagName('parsererror').length) return;
     doc.querySelectorAll('script, foreignObject').forEach((n) => n.remove());
-    frame.replaceChildren(document.importNode(doc.documentElement, true));
+    const svg = document.importNode(doc.documentElement, true) as unknown as SVGSVGElement;
+    // Ink drawn during the show, in slide points like the slide itself.
+    if (Array.isArray(m.ink)) {
+      for (const s of m.ink as InkStroke[]) {
+        if (!s || typeof s.d !== 'string') continue;
+        const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        p.setAttribute('d', s.d);
+        p.setAttribute('fill', 'none');
+        p.setAttribute('stroke', typeof s.color === 'string' ? s.color : '#E53935');
+        p.setAttribute('stroke-width', String(Number(s.width) || 3));
+        p.setAttribute('stroke-linecap', 'round');
+        p.setAttribute('stroke-linejoin', 'round');
+        if (s.highlighter) p.setAttribute('opacity', '0.4');
+        p.setAttribute('pointer-events', 'none');
+        svg.appendChild(p);
+      }
+    }
+    frame.replaceChildren(svg);
     if (m.screen === 'black' || m.screen === 'white') frame.replaceChildren(Object.assign(document.createElement('div'), { style: `position:absolute;inset:0;background:${m.screen === 'black' ? '#000' : '#fff'}` }));
   };
   return () => { ch.close(); wrap.remove(); };

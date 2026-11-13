@@ -11,6 +11,7 @@ import { geometryPath, textRect } from '../model/geometry';
 import { layoutText, type LayoutResult } from './text';
 import { renderChart } from './chart';
 import { fontFamilyCss } from '../fonts';
+import { escXml } from '../util/sanitize';
 
 export interface RenderOptions {
   mode?: 'edit' | 'show' | 'thumb' | 'print';
@@ -36,8 +37,13 @@ export interface RenderOptions {
 }
 
 let uid = 0;
-const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-const n = (v: number) => (Number.isFinite(v) ? +v.toFixed(2) : 0);
+/** Escapes text for markup; also drops characters that are illegal in XML (they blank the slide in XML parsers). */
+export const esc = escXml;
+const n = (v: unknown) => { const x = Number(v); return Number.isFinite(x) ? +x.toFixed(2) : 0; };
+/** A number in [0, 1] (opacities). */
+const unit = (v: unknown, dflt: number) => { const x = Number(v); return Number.isFinite(x) ? Math.max(0, Math.min(1, +x.toFixed(3))) : dflt; };
+const CAPS: Record<string, string> = { flat: 'butt', butt: 'butt', round: 'round', square: 'square', sq: 'square' };
+const JOINS: Record<string, string> = { round: 'round', bevel: 'bevel', miter: 'miter' };
 
 interface Ctx {
   deck: Deck;
@@ -161,9 +167,9 @@ function effectFilter(ctx: Ctx, fx: Effects): string {
   if (fx.shadow) {
     const s = fx.shadow;
     const rad = (s.dir * Math.PI) / 180;
-    parts.push(`<feDropShadow dx="${n(Math.cos(rad) * s.dist)}" dy="${n(Math.sin(rad) * s.dist)}" stdDeviation="${n(s.blur / 2)}" flood-color="${cssColor(s.color, ctx.cc)}" flood-opacity="${s.alpha ?? 0.4}"/>`);
+    parts.push(`<feDropShadow dx="${n(Math.cos(rad) * s.dist)}" dy="${n(Math.sin(rad) * s.dist)}" stdDeviation="${n(s.blur / 2)}" flood-color="${esc(cssColor(s.color, ctx.cc))}" flood-opacity="${unit(s.alpha, 0.4)}"/>`);
   }
-  if (fx.glow) parts.push(`<feMorphology operator="dilate" radius="${n(fx.glow.rad / 3)}" in="SourceAlpha" result="g1"/><feGaussianBlur in="g1" stdDeviation="${n(fx.glow.rad / 2)}" result="g2"/><feFlood flood-color="${cssColor(fx.glow.color, ctx.cc)}" flood-opacity="0.6"/><feComposite in2="g2" operator="in" result="g3"/><feMerge><feMergeNode in="g3"/><feMergeNode in="SourceGraphic"/></feMerge>`);
+  if (fx.glow) parts.push(`<feMorphology operator="dilate" radius="${n(fx.glow.rad / 3)}" in="SourceAlpha" result="g1"/><feGaussianBlur in="g1" stdDeviation="${n(fx.glow.rad / 2)}" result="g2"/><feFlood flood-color="${esc(cssColor(fx.glow.color, ctx.cc))}" flood-opacity="0.6"/><feComposite in2="g2" operator="in" result="g3"/><feMerge><feMergeNode in="g3"/><feMergeNode in="SourceGraphic"/></feMerge>`);
   if (fx.softEdge) parts.push(`<feGaussianBlur stdDeviation="${n(fx.softEdge / 3)}"/>`);
   if (!parts.length) return '';
   ctx.defs.push(`<filter id="${id}" x="-50%" y="-50%" width="200%" height="200%">${parts.join('')}</filter>`);
@@ -175,10 +181,10 @@ function effectFilter(ctx: Ctx, fx: Effects): string {
 
 export function fillPaint(ctx: Ctx, fill: Fill | undefined, w: number, h: number): string {
   if (!fill || fill.type === 'none') return 'none';
-  if (fill.type === 'solid') return cssColor(fill.color, ctx.cc);
+  if (fill.type === 'solid') return esc(cssColor(fill.color, ctx.cc));
   if (fill.type === 'gradient') {
     const id = `${ctx.prefix}g${ctx.defs.length}`;
-    const stops = fill.stops.map((s) => `<stop offset="${n(s.pos * 100)}%" stop-color="${cssColor(s.color, ctx.cc)}"/>`).join('');
+    const stops = fill.stops.map((s) => `<stop offset="${n(s.pos * 100)}%" stop-color="${esc(cssColor(s.color, ctx.cc))}"/>`).join('');
     if (fill.path === 'radial') ctx.defs.push(`<radialGradient id="${id}">${stops}</radialGradient>`);
     else {
       const a = ((fill.angle ?? 90) * Math.PI) / 180;
@@ -189,14 +195,14 @@ export function fillPaint(ctx: Ctx, fill: Fill | undefined, w: number, h: number
   }
   if (fill.type === 'image') {
     const id = `${ctx.prefix}i${ctx.defs.length}`;
-    const href = ctx.deck.mediaUrl(fill.media);
+    const href = esc(ctx.deck.mediaUrl(fill.media));
     if (fill.mode === 'tile') ctx.defs.push(`<pattern id="${id}" patternUnits="userSpaceOnUse" width="96" height="96"><image href="${href}" width="96" height="96"/></pattern>`);
-    else ctx.defs.push(`<pattern id="${id}" patternUnits="objectBoundingBox" width="1" height="1" patternContentUnits="objectBoundingBox"><image href="${href}" width="1" height="1" preserveAspectRatio="none"${fill.alpha != null ? ` opacity="${fill.alpha}"` : ''}/></pattern>`);
+    else ctx.defs.push(`<pattern id="${id}" patternUnits="objectBoundingBox" width="1" height="1" patternContentUnits="objectBoundingBox"><image href="${href}" width="1" height="1" preserveAspectRatio="none"${fill.alpha != null ? ` opacity="${unit(fill.alpha, 1)}"` : ''}/></pattern>`);
     return `url(#${id})`;
   }
   if (fill.type === 'pattern') {
     const id = `${ctx.prefix}p${ctx.defs.length}`;
-    const fg = cssColor(fill.fg, ctx.cc), bg = cssColor(fill.bg, ctx.cc, '#FFFFFF');
+    const fg = esc(cssColor(fill.fg, ctx.cc)), bg = esc(cssColor(fill.bg, ctx.cc, '#FFFFFF'));
     const p = fill.preset || '';
     const mark = /horz/i.test(p) ? `<path d="M0 4 H8" stroke="${fg}"/>` : /vert/i.test(p) ? `<path d="M4 0 V8" stroke="${fg}"/>` : /dn|down|wd/i.test(p) ? `<path d="M0 0 L8 8" stroke="${fg}"/>` : /cross/i.test(p) ? `<path d="M0 4 H8 M4 0 V8" stroke="${fg}"/>` : /up/i.test(p) ? `<path d="M0 8 L8 0" stroke="${fg}"/>` : `<rect x="3" y="3" width="2" height="2" fill="${fg}"/>`;
     ctx.defs.push(`<pattern id="${id}" patternUnits="userSpaceOnUse" width="8" height="8"><rect width="8" height="8" fill="${bg}"/>${mark}</pattern>`);
@@ -212,12 +218,12 @@ const DASH: Record<string, (w: number) => string> = {
 
 function strokeAttrs(ctx: Ctx, line: Line | undefined): string {
   if (!line || !line.fill || line.fill.type === 'none') return ' stroke="none"';
-  const color = line.fill.type === 'solid' ? cssColor(line.fill.color, ctx.cc) : fillPaint(ctx, line.fill, 1, 1);
-  const w = line.width ?? 0.75;
+  const color = line.fill.type === 'solid' ? esc(cssColor(line.fill.color, ctx.cc)) : fillPaint(ctx, line.fill, 1, 1);
+  const w = line.width == null ? 0.75 : n(line.width);
   let a = ` stroke="${color}" stroke-width="${n(w)}"`;
-  if (line.dash && line.dash !== 'solid') a += ` stroke-dasharray="${DASH[line.dash]?.(Math.max(w, 1)) || ''}"`;
-  if (line.cap) a += ` stroke-linecap="${line.cap === 'flat' ? 'butt' : line.cap}"`;
-  if (line.join) a += ` stroke-linejoin="${line.join}"`;
+  if (line.dash && line.dash !== 'solid' && Object.prototype.hasOwnProperty.call(DASH, line.dash)) a += ` stroke-dasharray="${DASH[line.dash](Math.max(n(w), 1))}"`;
+  if (line.cap && CAPS[line.cap]) a += ` stroke-linecap="${CAPS[line.cap]}"`;
+  if (line.join && JOINS[line.join]) a += ` stroke-linejoin="${JOINS[line.join]}"`;
   for (const end of ['head', 'tail'] as const) {
     const kind = line[end];
     if (!kind || kind === 'none') continue;
@@ -250,7 +256,7 @@ function shapeSvg(ctx: Ctx, el: ShapeElement, owner: Owner, w: number, h: number
   let out = '';
   const paint = open ? 'none' : fillPaint(ctx, fill, w, h);
   const stroke = strokeAttrs(ctx, line);
-  if (paint !== 'none' || !stroke.includes('stroke="none"')) out += `<path d="${d}" fill="${paint}"${stroke} fill-rule="evenodd"/>`;
+  if (paint !== 'none' || !stroke.includes('stroke="none"')) out += `<path d="${esc(d)}" fill="${paint}"${stroke} fill-rule="evenodd"/>`;
   else if (ctx.opts.mode === 'edit' && el.ph) out += `<rect width="${n(w)}" height="${n(h)}" fill="none" stroke="#9aa0a6" stroke-width="0.75" stroke-dasharray="3 2" class="qs-ph-outline"/>`;
   else out += `<rect width="${n(w)}" height="${n(h)}" fill="transparent" stroke="none"/>`;
   // Text is not mirrored with the shape.
@@ -308,7 +314,7 @@ function linesSvg(ctx: Ctx, lay: LayoutResult, body: Omit<TextBody, 'paras' | 'l
     const free = ln.avail - ln.width;
     const dx = ln.align === 'ctr' ? free / 2 : ln.align === 'r' ? free : 0;
     if (ln.bullet) {
-      const bc = cssColor(ln.bullet.color, ctx.cc);
+      const bc = esc(cssColor(ln.bullet.color, ctx.cc));
       out.push(`<text x="${n(ln.bullet.x)}" y="${n(y)}" font-family="${esc(fontFamilyCss(ln.bullet.font))}" font-size="${n(ln.bullet.size)}" fill="${bc}">${esc(ln.bullet.text)}</text>`);
     }
     if (!ln.segs.length) continue;
@@ -317,8 +323,8 @@ function linesSvg(ctx: Ctx, lay: LayoutResult, body: Omit<TextBody, 'paras' | 'l
     for (const s of ln.segs) {
       const st = s.style;
       const x = ln.left + dx + s.x;
-      const fill = prompt ? '#80868b' : cssColor(st.color, ctx.cc);
-      if (st.highlight) deco.push(`<rect x="${n(x)}" y="${n(y - s.size * 0.85)}" width="${n(s.w)}" height="${n(s.size * 1.1)}" fill="${cssColor(st.highlight, ctx.cc)}"/>`);
+      const fill = prompt ? '#80868b' : esc(cssColor(st.color, ctx.cc));
+      if (st.highlight) deco.push(`<rect x="${n(x)}" y="${n(y - s.size * 0.85)}" width="${n(s.w)}" height="${n(s.size * 1.1)}" fill="${esc(cssColor(st.highlight, ctx.cc))}"/>`);
       const dec = [st.u ? 'underline' : '', st.strike ? 'line-through' : ''].filter(Boolean).join(' ');
       const shift = st.baseline ? ` dy="${n(-(st.baseline / 100) * s.size * 1.4)}"` : '';
       spans.push(`<tspan x="${n(x)}" y="${n(y)}"${shift} font-family="${esc(fontFamilyCss(s.font))}" font-size="${n(s.size)}"${st.b ? ' font-weight="bold"' : ''}${st.i ? ' font-style="italic"' : ''}${dec ? ` text-decoration="${dec}"` : ''}${st.spc ? ` letter-spacing="${n(st.spc)}"` : ''}${st.caps === 'small' ? ' font-variant="small-caps"' : ''} fill="${fill}">${esc(s.text)}</tspan>`);
@@ -334,12 +340,12 @@ function linesSvg(ctx: Ctx, lay: LayoutResult, body: Omit<TextBody, 'paras' | 'l
 // Pictures, tables, media
 
 function pictureSvg(ctx: Ctx, el: PictureElement, w: number, h: number): string {
-  const href = ctx.deck.mediaUrl(el.media);
-  const [cl, ct, cr, cb] = el.crop || [0, 0, 0, 0];
+  const href = esc(ctx.deck.mediaUrl(el.media));
+  const [cl, ct, cr, cb] = (Array.isArray(el.crop) ? el.crop : [0, 0, 0, 0]).map((v) => n(v));
   const vw = 1 - cl - cr, vh = 1 - ct - cb;
   const iw = w / (vw || 1), ih = h / (vh || 1);
   const id = `${ctx.prefix}c${ctx.defs.length}`;
-  const geom = el.geom && el.geom !== 'rect' ? geometryPath(el.geom, w, h).d : `M0 0 H${n(w)} V${n(h)} H0 Z`;
+  const geom = esc(el.geom && el.geom !== 'rect' ? geometryPath(el.geom, w, h).d : `M0 0 H${n(w)} V${n(h)} H0 Z`);
   ctx.defs.push(`<clipPath id="${id}"><path d="${geom}"/></clipPath>`);
   let filter = '';
   const a = el.adjust;
@@ -363,8 +369,9 @@ function tableSvg(ctx: Ctx, t: TableElement, owner: Owner, w: number, h: number)
   for (const c of t.cols) colX.push(colX[colX.length - 1] + c);
   const sx = colX[colX.length - 1] ? w / colX[colX.length - 1] : 1;
   let y = 0;
-  const totalH = t.rows.reduce((a, r) => a + r.h, 0);
-  const sy = totalH && totalH > h ? 1 : 1;
+  const totalH = t.rows.reduce((a, r) => a + (Number(r.h) > 0 ? Number(r.h) : 0), 0);
+  // Rows are stretched or squeezed to the table frame (row heights are proportions of it).
+  const sy = totalH > 0 && h > 0 ? h / totalH : 1;
   const st = t.style || {};
   const accent: Color = st.accent || 'accent1';
   t.rows.forEach((row, ri) => {
@@ -404,7 +411,7 @@ function tableSvg(ctx: Ctx, t: TableElement, owner: Owner, w: number, h: number)
 }
 
 function mediaSvg(ctx: Ctx, el: MediaElement, w: number, h: number): string {
-  if (el.poster) return `<image href="${ctx.deck.mediaUrl(el.poster)}" width="${n(w)}" height="${n(h)}" preserveAspectRatio="xMidYMid slice"/>`;
+  if (el.poster) return `<image href="${esc(ctx.deck.mediaUrl(el.poster))}" width="${n(w)}" height="${n(h)}" preserveAspectRatio="xMidYMid slice"/>`;
   const r = Math.min(w, h) * 0.18;
   const icon = el.mediaKind === 'audio'
     ? `<path d="M${n(w / 2 - r)} ${n(h / 2 - r / 2)} h${n(r * 0.6)} l${n(r * 0.8)} ${n(-r * 0.6)} v${n(r * 2.2)} l${n(-r * 0.8)} ${n(-r * 0.6)} h${n(-r * 0.6)} Z" fill="#fff"/>`

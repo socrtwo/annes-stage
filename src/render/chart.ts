@@ -2,8 +2,11 @@
 import type { ChartElement, Color } from '../model/types';
 
 type Chart = ChartElement['chart'];
+import { escXml as esc } from '../util/sanitize';
+
 const n = (v: number) => (Number.isFinite(v) ? +v.toFixed(2) : 0);
-const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+/** A data value as a finite number, or null for blanks and junk. */
+const num = (v: unknown): number | null => (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
 const SERIES: Color[] = ['accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6'];
 
 function niceMax(v: number): number {
@@ -28,7 +31,7 @@ export function renderChart(c: Chart, w: number, h: number, color: (c: Color) =>
   if (legend === 'b' && legendItems.length) {
     bottom -= 22;
     let x = 0;
-    const widths = legendItems.map((t) => 16 + t.length * 6.5 + 12);
+    const widths = legendItems.map((t) => 16 + String(t ?? '').length * 6.5 + 12);
     const total = widths.reduce((a, b) => a + b, 0);
     x = Math.max(4, (w - total) / 2);
     legendItems.forEach((t, i) => {
@@ -41,7 +44,7 @@ export function renderChart(c: Chart, w: number, h: number, color: (c: Color) =>
   }
   const pw = right - 8, ph = bottom - top;
   if (isPie) {
-    const vals = (c.series[0]?.values || []).map((v) => Math.max(0, v || 0));
+    const vals = (c.series[0]?.values || []).map((v) => Math.max(0, num(v) ?? 0));
     const sum = vals.reduce((a, b) => a + b, 0) || 1;
     const cx = 8 + pw / 2, cy = top + ph / 2, r = Math.max(4, Math.min(pw, ph) / 2 - 4);
     let a0 = -Math.PI / 2;
@@ -56,14 +59,30 @@ export function renderChart(c: Chart, w: number, h: number, color: (c: Color) =>
     if (c.type === 'doughnut') out.push(`<circle cx="${n(cx)}" cy="${n(cy)}" r="${n(r * 0.5)}" fill="${color('bg1')}"/>`);
     return out.join('');
   }
-  const all = c.series.flatMap((s) => s.values.filter((v): v is number => v != null));
-  let maxV = Math.max(0, ...all), minV = Math.min(0, ...all);
-  if (c.stacked) {
-    const sums = c.categories.map((_, i) => c.series.reduce((a, s) => a + Math.max(0, s.values[i] || 0), 0));
-    maxV = c.stacked === 'percent' ? 1 : Math.max(0, ...sums);
+  // Value of each point and the base it stands on. Stacked charts (column, bar, line, area) stack
+  // positives and negatives separately; 100% stacked divides by the category's total magnitude.
+  const nc = Math.max(1, c.categories.length);
+  const stackable = c.type === 'column' || c.type === 'bar' || c.type === 'line' || c.type === 'area';
+  const stacked = stackable ? c.stacked : undefined;
+  const raw = c.series.map((s) => (s.values || []).map(num));
+  const pts: ({ from: number; to: number; raw: number } | null)[][] = raw.map((vals) => vals.map((v) => (v == null ? null : { from: 0, to: v, raw: v })));
+  if (stacked) {
+    for (let i = 0; i < nc; i++) {
+      const tot = raw.reduce((a, vals) => a + Math.abs(vals[i] ?? 0), 0) || 1;
+      let pos = 0, neg = 0;
+      raw.forEach((vals, si) => {
+        const v0 = vals[i];
+        if (v0 == null) return;
+        const v = stacked === 'percent' ? v0 / tot : v0;
+        if (v >= 0) { pts[si][i] = { from: pos, to: pos + v, raw: v0 }; pos += v; }
+        else { pts[si][i] = { from: neg, to: neg + v, raw: v0 }; neg += v; }
+      });
+    }
   }
-  maxV = niceMax(maxV);
-  if (minV < 0) minV = -niceMax(-minV);
+  const ends = pts.flatMap((row) => row.flatMap((p) => (p ? [p.from, p.to] : [])));
+  let maxV = Math.max(0, ...ends), minV = Math.min(0, ...ends);
+  if (stacked === 'percent') { maxV = maxV > 1e-9 ? 1 : 0; minV = minV < -1e-9 ? -1 : 0; if (!maxV && !minV) maxV = 1; }
+  else { maxV = maxV > 0 || minV >= 0 ? niceMax(maxV) : 0; if (minV < 0) minV = -niceMax(-minV); }
   const left = 8 + 40;
   const plotW = pw - 40, plotH = ph - 18;
   const horizontal = c.type === 'bar';
@@ -71,11 +90,10 @@ export function renderChart(c: Chart, w: number, h: number, color: (c: Color) =>
   // Gridlines and value axis
   for (let k = 0; k <= 4; k++) {
     const v = minV + ((maxV - minV) * k) / 4;
-    const label = c.stacked === 'percent' ? `${Math.round(v * 100)}%` : Math.abs(v) >= 1000 ? `${+(v / 1000).toFixed(1)}k` : `${+v.toFixed(2)}`;
+    const label = stacked === 'percent' ? `${Math.round(v * 100)}%` : Math.abs(v) >= 1000 ? `${+(v / 1000).toFixed(1)}k` : `${+v.toFixed(2)}`;
     if (horizontal) { const x = left + scale(v); out.push(`<path d="M${n(x)} ${n(top)} V${n(top + plotH)}" stroke="#ccc" stroke-width="0.5"/><text x="${n(x)}" y="${n(top + plotH + 13)}" text-anchor="middle" font-size="10" ${font} fill="${txt}">${label}</text>`); }
     else { const y = top + scale(v); out.push(`<path d="M${n(left)} ${n(y)} H${n(left + plotW)}" stroke="#ccc" stroke-width="0.5"/><text x="${n(left - 4)}" y="${n(y + 3)}" text-anchor="end" font-size="10" ${font} fill="${txt}">${label}</text>`); }
   }
-  const nc = Math.max(1, c.categories.length);
   const band = (horizontal ? plotH : plotW) / nc;
   c.categories.forEach((cat, i) => {
     if (horizontal) out.push(`<text x="${n(left - 4)}" y="${n(top + band * (i + 0.5) + 3)}" text-anchor="end" font-size="10" ${font} fill="${txt}">${esc(cat)}</text>`);
@@ -84,34 +102,40 @@ export function renderChart(c: Chart, w: number, h: number, color: (c: Color) =>
   if (c.type === 'column' || c.type === 'bar') {
     const ns = c.series.length || 1;
     const gap = band * 0.2;
-    const bw = c.stacked ? band - 2 * gap : (band - 2 * gap) / ns;
-    const base = new Array(nc).fill(0);
-    const sums = c.categories.map((_, i) => c.series.reduce((a, s) => a + Math.max(0, s.values[i] || 0), 0) || 1);
-    c.series.forEach((s, si) => {
-      s.values.forEach((raw, i) => {
-        if (raw == null || i >= nc) return;
-        const v = c.stacked === 'percent' ? raw / sums[i] : raw;
-        const from = c.stacked ? base[i] : 0, to = from + v;
-        if (c.stacked) base[i] = to;
-        const off = band * i + gap + (c.stacked ? 0 : bw * si);
+    const bw = stacked ? band - 2 * gap : (band - 2 * gap) / ns;
+    pts.forEach((row, si) => {
+      row.forEach((p, i) => {
+        if (!p || i >= nc) return;
+        const { from, to } = p;
+        const off = band * i + gap + (stacked ? 0 : bw * si);
         if (horizontal) { const x0 = left + scale(Math.min(from, to)), x1 = left + scale(Math.max(from, to)); out.push(`<rect x="${n(x0)}" y="${n(top + off)}" width="${n(x1 - x0)}" height="${n(bw)}" fill="${seriesColor(si)}"/>`); }
         else { const y0 = top + scale(Math.max(from, to)), y1 = top + scale(Math.min(from, to)); out.push(`<rect x="${n(left + off)}" y="${n(y0)}" width="${n(bw)}" height="${n(y1 - y0)}" fill="${seriesColor(si)}"/>`); }
-        if (c.labels) out.push(`<text x="${n(horizontal ? left + scale(to) + 3 : left + off + bw / 2)}" y="${n(horizontal ? top + off + bw / 2 + 3 : top + scale(to) - 3)}" text-anchor="${horizontal ? 'start' : 'middle'}" font-size="10" ${font} fill="${txt}">${+raw.toFixed(2)}</text>`);
+        if (c.labels) out.push(`<text x="${n(horizontal ? left + scale(to) + 3 : left + off + bw / 2)}" y="${n(horizontal ? top + off + bw / 2 + 3 : top + scale(to) - 3)}" text-anchor="${horizontal ? 'start' : 'middle'}" font-size="10" ${font} fill="${txt}">${+p.raw.toFixed(2)}</text>`);
       });
     });
   } else if (c.type === 'line' || c.type === 'area' || c.type === 'radar') {
-    c.series.forEach((s, si) => {
-      const pts = s.values.map((v, i) => [left + band * (i + 0.5), top + scale(v ?? 0)] as [number, number]);
-      if (!pts.length) return;
-      const d = 'M' + pts.map(([x, y]) => `${n(x)} ${n(y)}`).join(' L');
-      if (c.type === 'area') out.push(`<path d="${d} L${n(pts[pts.length - 1][0])} ${n(top + scale(Math.max(0, minV)))} L${n(pts[0][0])} ${n(top + scale(Math.max(0, minV)))} Z" fill="${seriesColor(si)}" opacity="0.7"/>`);
-      out.push(`<path d="${d}" fill="none" stroke="${seriesColor(si)}" stroke-width="2.25"/>`);
-      for (const [x, y] of pts) out.push(`<circle cx="${n(x)}" cy="${n(y)}" r="2.5" fill="${seriesColor(si)}"/>`);
+    const X = (i: number) => left + band * (i + 0.5);
+    const zero = top + scale(Math.max(0, minV));
+    pts.forEach((row, si) => {
+      // Blank values break the line (and the area) into runs.
+      const runs: { i: number; p: { from: number; to: number } }[][] = [];
+      let cur: { i: number; p: { from: number; to: number } }[] = [];
+      row.forEach((p, i) => { if (i >= nc) return; if (p) cur.push({ i, p }); else if (cur.length) { runs.push(cur); cur = []; } });
+      if (cur.length) runs.push(cur);
+      for (const run of runs) {
+        const d = 'M' + run.map(({ i, p }) => `${n(X(i))} ${n(top + scale(p.to))}`).join(' L');
+        if (c.type === 'area') {
+          const back = stacked ? run.slice().reverse().map(({ i, p }) => `L${n(X(i))} ${n(top + scale(p.from))}`).join(' ') : `L${n(X(run[run.length - 1].i))} ${n(zero)} L${n(X(run[0].i))} ${n(zero)}`;
+          out.push(`<path d="${d} ${back} Z" fill="${seriesColor(si)}" opacity="0.7"/>`);
+        }
+        out.push(`<path d="${d}" fill="none" stroke="${seriesColor(si)}" stroke-width="2.25"/>`);
+        for (const { i, p } of run) out.push(`<circle cx="${n(X(i))}" cy="${n(top + scale(p.to))}" r="2.5" fill="${seriesColor(si)}"/>`);
+      }
     });
   } else if (c.type === 'scatter') {
-    const xs = c.categories.map((t, i) => (Number.isFinite(+t) ? +t : i + 1));
+    const xs = c.categories.map((t, i) => (t !== '' && Number.isFinite(+t) ? +t : i + 1));
     const xmax = niceMax(Math.max(...xs, 1)), xmin = Math.min(0, ...xs);
-    c.series.forEach((s, si) => s.values.forEach((v, i) => {
+    raw.forEach((vals, si) => vals.forEach((v, i) => {
       if (v == null) return;
       out.push(`<circle cx="${n(left + ((xs[i] - xmin) / (xmax - xmin)) * plotW)}" cy="${n(top + scale(v))}" r="3.5" fill="${seriesColor(si)}"/>`);
     }));
