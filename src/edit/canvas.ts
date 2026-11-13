@@ -277,8 +277,17 @@ export class Canvas {
         if (hd.includes('n')) y = b.y + b.h - hh;
       }
       if (e.ctrlKey) { x = b.x - (w - b.w) / 2; y = b.y - (hh - b.h) / 2; }
-      const isLine = el?.kind === 'shape' && /^(line|straightConnector1)/.test((el as ShapeElement).geom);
-      if (!isLine) { if (w < 1) w = 1; if (hh < 1) hh = 1; }
+      const isLine = el?.kind === 'shape' && LINE_GEOM.test((el as ShapeElement).geom);
+      let flipH = b.flipH, flipV = b.flipV;
+      if (isLine) {
+        // Dragging an end past the other one mirrors the line instead of collapsing it.
+        if (w < 0) { x += w; w = -w; flipH = !flipH; }
+        if (hh < 0) { y += hh; hh = -hh; flipV = !flipV; }
+      } else {
+        // Keep the edge opposite the dragged handle where it was.
+        if (w < 1) { if (hd.includes('w') && !e.ctrlKey) x = b.x + b.w - 1; w = 1; }
+        if (hh < 1) { if (hd.includes('n') && !e.ctrlKey) y = b.y + b.h - 1; hh = 1; }
+      }
       // Snap only the edges being dragged.
       if (!isLine && !b.rot && !keepRatio) {
         if (hd.includes('w')) { const nx = snap(x); w += x - nx; x = nx; }
@@ -286,7 +295,12 @@ export class Canvas {
         if (hd.includes('n')) { const ny = snap(y); hh += y - ny; y = ny; }
         if (hd.includes('s')) hh = Math.max(1, snap(y + hh) - y);
       }
-      this.preview = new Map([[d.id, { x, y, w, h: hh }]]);
+      if (b.rot) {
+        // The box is resized in its own frame; it rotates about its centre, so move the centre by the
+        // rotated shift of the local centre to keep the anchored edge fixed on the page.
+        ({ x, y } = rotatedResizeOrigin(b, { x, y, w, h: hh }));
+      }
+      this.preview = new Map([[d.id, isLine ? { x, y, w, h: hh, flipH, flipV } : { x, y, w, h: hh }]]);
       this.render();
     } else if (d.kind === 'rotate') {
       let ang = (Math.atan2(p.y - d.center.y, p.x - d.center.x) * 180) / Math.PI + 90;
@@ -424,8 +438,9 @@ export class Canvas {
     ed.destroy();
     const o = this.owner;
     const el = o?.elements.find((e) => e.id === ed.el.id) as ShapeElement | undefined;
-    const before = JSON.stringify(el?.text?.paras || []);
-    if (el && JSON.stringify(paras) !== before) {
+    // Only a session that changed something becomes an undo step (re-reading the DOM can differ
+    // from the stored paragraphs in harmless ways, e.g. a missing text body).
+    if (el && ed.changed && JSON.stringify(paras) !== JSON.stringify(el.text?.paras || [])) {
       edit(this.app, 'Typing', (own) => {
         const t = own.elements.find((e) => e.id === el.id) as ShapeElement;
         t.text = { ...(t.text || {}), paras };
@@ -463,7 +478,7 @@ export class Canvas {
       if (k === 'Tab') { e.preventDefault(); this.cycle(e.shiftKey ? -1 : 1); return; }
       if (k.length === 1 && this.selection.length === 1) {
         const el = app.selected[0];
-        if (el?.kind === 'shape') { e.preventDefault(); this.editText(el.id); requestAnimationFrame(() => document.execCommand('insertText', false, k)); return; }
+        if (el?.kind === 'shape') { e.preventDefault(); this.editText(el.id); if (this.editor) document.execCommand('insertText', false, k); return; }
       }
     } else if (!this.selection.length && !e.ctrlKey && !e.metaKey && !e.altKey) {
       if (k === 'Tab') { e.preventDefault(); this.cycle(e.shiftKey ? -1 : 1); return; }
@@ -504,6 +519,21 @@ export class Canvas {
   destroy(): void { this.editor?.destroy(); this.el.remove(); }
 }
 
+const LINE_GEOM = /^(line|straightConnector1|bentConnector\d|curvedConnector\d)$/;
+
+/**
+ * Page origin of a rotated box resized in its local (unrotated) frame: `nb` is the new box expressed
+ * in the old box's unrotated coordinates. The new centre is the old centre plus the local centre
+ * shift rotated by the box's rotation.
+ */
+export function rotatedResizeOrigin(old: { x: number; y: number; w: number; h: number; rot?: number }, nb: { x: number; y: number; w: number; h: number }): { x: number; y: number } {
+  const a = ((old.rot || 0) * Math.PI) / 180;
+  const cx = old.x + old.w / 2, cy = old.y + old.h / 2;
+  const lx = nb.x + nb.w / 2 - cx, ly = nb.y + nb.h / 2 - cy;
+  const px = cx + lx * Math.cos(a) - ly * Math.sin(a), py = cy + lx * Math.sin(a) + ly * Math.cos(a);
+  return { x: px - nb.w / 2, y: py - nb.h / 2 };
+}
+
 function applyBoxShallow(e: Element, cur: Box, b: Partial<Box>): void {
   const nb = { ...cur, ...b };
   if (e.kind === 'group') {
@@ -512,6 +542,8 @@ function applyBoxShallow(e: Element, cur: Box, b: Partial<Box>): void {
     walk(e.children);
   }
   e.x = nb.x; e.y = nb.y; e.w = nb.w; e.h = nb.h; e.rot = nb.rot;
+  if (b.flipH != null) e.flipH = b.flipH || undefined;
+  if (b.flipV != null) e.flipV = b.flipV || undefined;
 }
 
 export function inkPath(pts: [number, number][]): string {

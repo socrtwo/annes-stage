@@ -53,11 +53,11 @@ export class TextEditor {
     this.root.addEventListener('input', (e) => this.onInput(e as InputEvent));
     this.root.addEventListener('paste', (e) => this.onPaste(e));
     active = this;
-    requestAnimationFrame(() => {
-      this.root.focus();
-      if (this.selectAll) { const r = document.createRange(); r.selectNodeContents(this.root); setSel(r); }
-      else this.setPos({ para: this.root.children.length - 1, off: Infinity });
-    });
+    // Focus and place the caret right away (not in a later frame) so keys typed immediately after
+    // the double-click or type-to-edit keystroke land in the editor.
+    this.root.focus({ preventScroll: true });
+    if (this.selectAll) { const r = document.createRange(); r.selectNodeContents(this.root); setSel(r); }
+    else this.setPos({ para: this.root.children.length - 1, off: Infinity });
   }
 
   private style(level: number): LevelStyle {
@@ -91,10 +91,13 @@ export class TextEditor {
       d.style.fontFamily = fontFamilyCss(themeFont(base.font, this.cc.theme) || this.cc.theme.fonts.minor);
       d.style.color = cssColor(base.color, this.cc);
       const bullet = p.bullet ?? st.bullet;
-      counters.length = Math.max(counters.length, p.level + 1);
-      for (let k = p.level + 1; k < counters.length; k++) counters[k] = 0;
-      if (bullet?.kind === 'num') counters[p.level] = (counters[p.level] || 0) + 1; else counters[p.level] = 0;
       const hasText = p.runs.some((r) => r.text);
+      // Empty paragraphs show no bullet and neither consume nor restart the numbering.
+      if (hasText) {
+        counters.length = Math.max(counters.length, p.level + 1);
+        for (let k = p.level + 1; k < counters.length; k++) counters[k] = 0;
+        if (bullet?.kind === 'num') counters[p.level] = (counters[p.level] || 0) + 1; else counters[p.level] = 0;
+      }
       const bt = bullet && bullet.kind !== 'none' && hasText ? bulletText(bullet, Math.max(0, (counters[p.level] || 1) - 1)) : '';
       if (bt) { d.dataset.bullet = bt; d.style.setProperty('--qs-hang', `${Math.max(0, -indent)}px`); }
       for (const r of p.runs) {
@@ -412,7 +415,9 @@ export class TextEditor {
     const m = /(\S+)$/.exec(before);
     if (!m) return;
     const word = m[1];
-    const rep = prefs.replacements[word] ?? prefs.replacements[word.toLowerCase()];
+    const reps = prefs.replacements || {};
+    const own = (k: string): string | undefined => (Object.hasOwn(reps, k) && typeof reps[k] === 'string' ? reps[k] : undefined);
+    const rep = own(word) ?? own(word.toLowerCase());
     let replacement: string | null = null;
     if (rep) replacement = /^[A-Z]/.test(word) && /^[a-z]/.test(rep) ? rep[0].toUpperCase() + rep.slice(1) : rep;
     else if (prefs.autoCapitalize && /^[a-z]/.test(word) && (before.length === word.length || /[.!?]\s+$/.test(before.slice(0, -word.length))) && /[\s.,;:!?]/.test(typed)) {
@@ -435,7 +440,7 @@ export class TextEditor {
     const text = e.clipboardData?.getData('text/plain');
     if (text == null) return;
     e.preventDefault();
-    document.execCommand('insertText', false, text.replace(/\r\n?/g, '\n'));
+    document.execCommand('insertText', false, cleanPastedText(text));
   }
 
   /** Ends editing; commit writes the paragraphs back to the model in one undoable step. */
@@ -452,6 +457,15 @@ export class TextEditor {
 }
 
 // ------------------------------------------------------------------------------------------
+
+/**
+ * Plain text for pasting: CRLF/CR become newlines, a vertical tab (PowerPoint's soft line break in
+ * plain text) becomes a newline, form feeds become paragraph breaks, and other control characters
+ * are dropped.
+ */
+export function cleanPastedText(text: string): string {
+  return text.replace(/\r\n?/g, '\n').replace(/[\x0B\x0C]/g, '\n').replace(/[\x00-\x08\x0E-\x1F\x7F]/g, '');
+}
 
 function setSel(r: Range): void {
   const s = window.getSelection();
